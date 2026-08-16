@@ -1,0 +1,53 @@
+{
+  "provider": {
+    "baseUrl": "https://dashscope.aliyuncs.com/compatible-mode/v1"
+  },
+  "defaults": {
+    "timeoutSeconds": 60
+  },
+  "routes": {
+    "text": [
+      "qwen3.7-plus",
+      "qwen3-coder-plus",
+      "qwen3-coder-next"
+    ],
+    "vision": [
+      "qwen3-vl-plus",
+      "qwen3.7-plus"
+    ],
+    "video": [
+      "qwen3.7-plus",
+      "qwen3-vl-plus"
+    ]
+  },
+  "models": [
+    {
+      "id": "qwen3.7-plus",
+      "input": [
+        "text",
+        "image",
+        "video"
+      ]
+    },
+    {
+      "id": "qwen3-coder-plus",
+      "input": [
+        "text"
+      ]
+    },
+    {
+      "id": "qwen3-coder-next",
+      "input": [
+        "text"
+      ]
+    },
+    {
+      "id": "qwen3-vl-plus",
+      "input": [
+        "text",
+        "image",
+        "video"
+      ]
+    }
+  ]
+}

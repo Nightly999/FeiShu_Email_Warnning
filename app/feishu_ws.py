@@ -1,0 +1,451 @@
+import asyncio
+import json
+import logging
+import multiprocessing
+import os
+import signal
+import threading
+import time
+import warnings
+from contextlib import contextmanager
+from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import asdict
+from pathlib import Path
+from typing import Any, Iterator
+
+import lark_oapi as lark
+from lark_oapi.api.im.v1 import (
+    P2ImChatAccessEventBotP2pChatEnteredV1,
+    P2ImMessageReceiveV1,
+)
+
+from app.bootstrap import bootstrap
+from app.builtin_commands import handle_builtin_text_command
+from app.event_dedup import claim_event, finish_event
+from app.feishu import (
+    TenantApp,
+    download_message_file,
+    event_scope_matches,
+    list_enabled_tenant_apps,
+    normalize_event,
+    reply_card,
+    reply_message,
+    update_card,
+)
+from app.feishu_cards import build_answer_card, build_processing_card, should_use_card
+from app.files.service import register_uploaded_file
+from app.file_analysis import safe_resource_path
+from app.graph import run_agent
+from app.logging_security import install_sensitive_log_filter
+from app.memory.sessions import get_active_session_id
+from app.scheduler import start_scheduler_thread
+from app.settings import get_settings
+
+
+logger = logging.getLogger("feishu_ws")
+PID_FILE = Path("data/feishu_ws_pids.json")
+ConversationKey = tuple[str, str, str]
+
+
+class ConversationSequencer:
+    """Preserve receive order within one conversation while allowing cross-chat concurrency."""
+
+    def __init__(self) -> None:
+        self._condition = threading.Condition()
+        self._issued: dict[ConversationKey, int] = {}
+        self._serving: dict[ConversationKey, int] = {}
+
+    def issue(self, key: ConversationKey) -> int:
+        with self._condition:
+            ticket = self._issued.get(key, 0)
+            self._issued[key] = ticket + 1
+            self._serving.setdefault(key, 0)
+            return ticket
+
+    @contextmanager
+    def turn(self, key: ConversationKey, ticket: int) -> Iterator[None]:
+        with self._condition:
+            self._condition.wait_for(lambda: self._serving.get(key, 0) == ticket)
+        try:
+            yield
+        finally:
+            with self._condition:
+                next_ticket = ticket + 1
+                self._serving[key] = next_ticket
+                if next_ticket >= self._issued.get(key, 0):
+                    self._serving.pop(key, None)
+                    self._issued.pop(key, None)
+                self._condition.notify_all()
+
+
+def main() -> None:
+    multiprocessing.freeze_support()
+    warnings.filterwarnings("ignore", category=DeprecationWarning)
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    install_sensitive_log_filter()
+    warn_stale_processes()
+    apps = asyncio.run(load_apps())
+    if not apps:
+        raise RuntimeError("No enabled Feishu apps found. Check config/feishu_apps.local.json")
+
+    processes: list[multiprocessing.Process] = []
+    for app in apps:
+        process = multiprocessing.Process(
+            target=run_client_process,
+            args=(asdict(app),),
+            name=f"feishu-ws-{app.bot_code}",
+            daemon=False,
+        )
+        process.start()
+        processes.append(process)
+
+    write_pid_file(processes)
+    start_scheduler_thread(apps)
+    logger.info("Started %s Feishu websocket processes. Press Ctrl+C to stop.", len(processes))
+    logger.info("Listening bot_code: %s", ", ".join(app.bot_code for app in apps))
+
+    try:
+        while True:
+            for process in processes:
+                if process.exitcode is not None:
+                    logger.error("Websocket process exited: name=%s exitcode=%s", process.name, process.exitcode)
+            time.sleep(5)
+    except KeyboardInterrupt:
+        logger.info("Stopping Feishu websocket processes...")
+    finally:
+        stop_processes(processes)
+        clear_pid_file()
+
+
+def stop_processes(processes: list[multiprocessing.Process]) -> None:
+    for process in processes:
+        if process.is_alive():
+            logger.info("Terminating websocket process: name=%s pid=%s", process.name, process.pid)
+            process.terminate()
+
+    deadline = time.time() + 10
+    for process in processes:
+        timeout = max(0.1, deadline - time.time())
+        process.join(timeout=timeout)
+
+    for process in processes:
+        if process.is_alive():
+            logger.warning("Killing unresponsive websocket process: name=%s pid=%s", process.name, process.pid)
+            try:
+                process.kill()
+            except AttributeError:
+                if process.pid:
+                    os.kill(process.pid, signal.SIGTERM)
+            process.join(timeout=5)
+
+
+def write_pid_file(processes: list[multiprocessing.Process]) -> None:
+    PID_FILE.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "parent_pid": os.getpid(),
+        "children": [
+            {"pid": process.pid, "name": process.name}
+            for process in processes
+            if process.pid
+        ],
+        "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    PID_FILE.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def clear_pid_file() -> None:
+    try:
+        PID_FILE.unlink(missing_ok=True)
+    except OSError:
+        logger.warning("Failed to remove websocket pid file: %s", PID_FILE)
+
+
+def warn_stale_processes() -> None:
+    if not PID_FILE.exists():
+        return
+
+    try:
+        payload = json.loads(PID_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        logger.warning("Found unreadable websocket pid file: %s", PID_FILE)
+        return
+
+    pids = [
+        int(item["pid"])
+        for item in payload.get("children", [])
+        if item.get("pid") and is_process_alive(int(item["pid"]))
+    ]
+    parent_pid = payload.get("parent_pid")
+    if parent_pid and is_process_alive(int(parent_pid)):
+        pids.insert(0, int(parent_pid))
+
+    if not pids:
+        clear_pid_file()
+        return
+
+    logger.warning(
+        "Found possible stale Feishu websocket processes from previous run: %s. "
+        "If replies look old or duplicated, stop them with: Stop-Process -Id %s -Force",
+        ", ".join(str(pid) for pid in pids),
+        ",".join(str(pid) for pid in pids),
+    )
+
+
+def is_process_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+async def load_apps() -> list[TenantApp]:
+    await bootstrap()
+    return [
+        app
+        for app in await list_enabled_tenant_apps()
+        if app.app_id != "cli_sample_app_id"
+    ]
+
+
+def run_client_process(app_payload: dict[str, Any]) -> None:
+    app = TenantApp(**app_payload)
+    warnings.filterwarnings("ignore", category=DeprecationWarning)
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    install_sensitive_log_filter()
+    settings = get_settings()
+    worker_count = max(1, settings.feishu_event_workers)
+    event_slots = threading.BoundedSemaphore(
+        worker_count + max(0, settings.feishu_event_queue_size)
+    )
+    event_executor = ThreadPoolExecutor(
+        max_workers=worker_count, thread_name_prefix=f"feishu-event-{app.bot_code}"
+    )
+    conversation_sequencer = ConversationSequencer()
+
+    def release_event_slot(_future: Future[None]) -> None:
+        event_slots.release()
+
+    def handle_message(data: P2ImMessageReceiveV1) -> None:
+        try:
+            payload = json.loads(lark.JSON.marshal(data))
+            if not event_slots.acquire(blocking=False):
+                logger.error("Event queue is full: bot_code=%s", app.bot_code)
+                return
+            try:
+                key = conversation_key(payload, app)
+                ticket = conversation_sequencer.issue(key)
+                future = event_executor.submit(
+                    process_event_thread,
+                    app_payload,
+                    payload,
+                    conversation_sequencer,
+                    key,
+                    ticket,
+                )
+                future.add_done_callback(release_event_slot)
+            except Exception:
+                event_slots.release()
+                raise
+        except Exception:
+            logger.exception("Failed to start event worker thread: bot_code=%s", app.bot_code)
+
+    def handle_bot_p2p_entered(data: P2ImChatAccessEventBotP2pChatEnteredV1) -> None:
+        try:
+            payload = json.loads(lark.JSON.marshal(data))
+            event = payload.get("event") or {}
+            operator = event.get("operator_id") or {}
+            logger.info(
+                "User opened bot chat: bot_code=%s open_id=%s chat_id=%s",
+                app.bot_code,
+                operator.get("open_id"),
+                event.get("chat_id"),
+            )
+        except Exception:
+            logger.exception("Failed to handle bot chat entered event: bot_code=%s", app.bot_code)
+
+    event_handler = (
+        lark.EventDispatcherHandler.builder(
+            app.encrypt_key or "",
+            app.verification_token or "",
+        )
+        .register_p2_im_message_receive_v1(handle_message)
+        .register_p2_im_chat_access_event_bot_p2p_chat_entered_v1(handle_bot_p2p_entered)
+        .build()
+    )
+    client = lark.ws.Client(
+        app_id=app.app_id,
+        app_secret=app.app_secret,
+        event_handler=event_handler,
+        log_level=lark.LogLevel.WARNING,
+        auto_reconnect=True,
+    )
+    logger.info("Starting Feishu websocket: bot_code=%s app_id=%s", app.bot_code, app.app_id)
+    client.start()
+
+
+def conversation_key(payload: dict[str, Any], app: TenantApp) -> ConversationKey:
+    event = normalize_event(payload, app, trust_event_tenant=True)
+    conversation_id = event.get("chat_id") or f"user:{event.get('open_id') or 'unknown'}"
+    return (event["tenant_key"], event["app_id"], conversation_id)
+
+
+def process_event_thread(
+    app_payload: dict[str, Any],
+    payload: dict[str, Any],
+    sequencer: ConversationSequencer | None = None,
+    key: ConversationKey | None = None,
+    ticket: int | None = None,
+) -> None:
+    app = TenantApp(**app_payload)
+    try:
+        if sequencer is not None and key is not None and ticket is not None:
+            with sequencer.turn(key, ticket):
+                asyncio.run(handle_queued_event(app, payload))
+        else:
+            asyncio.run(handle_queued_event(app, payload))
+    except Exception:
+        logger.exception("Failed to process Feishu message: bot_code=%s", app.bot_code)
+
+
+async def handle_queued_event(app: TenantApp, payload: dict[str, Any]) -> None:
+    if not event_scope_matches(payload, app, allow_unconfigured_tenant=True):
+        logger.warning("Ignore event with mismatched tenant scope: bot_code=%s", app.bot_code)
+        return
+    event = normalize_event(payload, app, trust_event_tenant=True)
+
+    message_id = event.get("message_id")
+    if message_id and not await claim_event(
+        tenant_key=event["tenant_key"], app_id=event["app_id"], message_id=message_id
+    ):
+        logger.info("Ignore duplicate message: bot_code=%s message_id=%s", app.bot_code, message_id)
+        return
+
+    try:
+        await dispatch_event(app, event)
+    except Exception as exc:
+        if message_id:
+            await finish_event(
+                tenant_key=event["tenant_key"],
+                app_id=event["app_id"],
+                message_id=message_id,
+                error=str(exc),
+            )
+        raise
+    else:
+        if message_id:
+            await finish_event(
+                tenant_key=event["tenant_key"], app_id=event["app_id"], message_id=message_id
+            )
+
+
+async def dispatch_event(app: TenantApp, event: dict[str, Any]) -> None:
+    if event.get("open_id") and event.get("message_type") in {
+        "text",
+        "file",
+        "image",
+        "media",
+        "video",
+    }:
+        event["_session_id"] = await get_active_session_id(
+            tenant_key=event["tenant_key"],
+            app_id=event["app_id"],
+            open_id=event["open_id"],
+            chat_id=event.get("chat_id"),
+            bot_code=event.get("bot_code"),
+        )
+    if event.get("message_type") in {"file", "image", "media", "video"}:
+        await handle_file_event(app, event)
+        return
+    if event.get("message_type") != "text":
+        logger.info("Ignore non-text message: bot_code=%s message_type=%s", app.bot_code, event.get("message_type"))
+        return
+    if not event.get("open_id") or not event.get("text"):
+        logger.info("Ignore message without open_id/text: bot_code=%s", app.bot_code)
+        return
+
+    logger.info(
+        "Received Feishu message: bot_code=%s tenant_key=%s open_id=%s message_id=%s chat_id=%s text_length=%s",
+        app.bot_code,
+        event.get("tenant_key"),
+        event.get("open_id"),
+        event.get("message_id"),
+        event.get("chat_id"),
+        len(event.get("text") or ""),
+    )
+    progress_message_id = None
+    if event.get("message_id"):
+        progress_message_id = await reply_card(app, event["message_id"], build_processing_card(event["text"]))
+    handled = await handle_builtin_text_command(app, event, progress_message_id)
+    if handled:
+        return
+    result = await run_agent(event)
+    answer = result.content
+    if event.get("message_id"):
+        if should_use_card(answer):
+            answer_card = build_answer_card(event["text"], answer, status=result.status)
+            if progress_message_id:
+                updated = await update_card(app, progress_message_id, answer_card)
+                if not updated:
+                    await reply_card(app, event["message_id"], answer_card)
+            else:
+                await reply_card(app, event["message_id"], answer_card)
+        else:
+            if progress_message_id:
+                updated = await update_card(
+                    app,
+                    progress_message_id,
+                    build_answer_card(event["text"], answer, status=result.status),
+                )
+                if not updated:
+                    await reply_message(app, event["message_id"], answer)
+            else:
+                await reply_message(app, event["message_id"], answer)
+
+
+async def handle_file_event(app: TenantApp, event: dict[str, Any]) -> None:
+    message_id = event.get("message_id")
+    file_key = event.get("file_key")
+    if not message_id or not file_key:
+        logger.info("Ignore resource message without message_id/file_key: bot_code=%s", app.bot_code)
+        return
+
+    logger.info(
+        "Received Feishu resource: bot_code=%s message_id=%s resource_type=%s file_name=%s",
+        app.bot_code,
+        message_id,
+        event.get("resource_type"),
+        event.get("file_name"),
+    )
+    progress_message_id = await reply_card(app, message_id, build_processing_card(event.get("file_name") or "文件"))
+    path = safe_resource_path(message_id, event.get("file_name"), event.get("resource_type"))
+    try:
+        await download_message_file(
+            app,
+            message_id=message_id,
+            file_key=file_key,
+            save_path=path,
+            resource_type=event.get("resource_type") or "file",
+        )
+        answer = await register_uploaded_file(event, path)
+        answer_status = "success"
+    except Exception:  # noqa: BLE001
+        logger.exception("Failed to download/analyze Feishu file: bot_code=%s", app.bot_code)
+        answer = "文件处理失败，请稍后重试；如果问题持续，请联系信息管理中心。"
+        answer_status = "error"
+    if progress_message_id:
+        await update_card(
+            app,
+            progress_message_id,
+            build_answer_card(
+                event.get("file_name") or "文件",
+                answer,
+                status=answer_status,
+            ),
+        )
+    else:
+        await reply_message(app, message_id, answer)
+
+
+if __name__ == "__main__":
+    main()

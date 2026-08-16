@@ -1,0 +1,19 @@
+{
+  "tools": {
+    "profile": "coding",
+    "allow": [
+      "erp-sqlserver__production_list",
+      "erp-sqlserver__sampleshedule_list",
+      "erp-sqlserver__sampleshedule_risk",
+      "erp-sqlserver__factory_list",
+      "erp-sqlserver__oa_shipping_bank_payment_report",
+      "erp-sqlserver__oa_bank_payment_list"
+    ],
+    "automation_allow": [
+      "erp-sqlserver__production_list",
+      "erp-sqlserver__sampleshedule_list",
+      "erp-sqlserver__sampleshedule_risk",
+      "erp-sqlserver__factory_list"
+    ]
+  }
+}

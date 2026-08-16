@@ -1,0 +1,9 @@
+.env
+data/
+config/*.local.json
+__pycache__/
+*.py[cod]
+.venv/
+*.log
+*.out
+*.err

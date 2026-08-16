@@ -1,0 +1,33 @@
+{
+  "tools": {
+    "profile": "coding",
+    "allow": [
+          "erp-sqlserver__fr_complete_period_list",
+          "erp-sqlserver__fr_complete_period_summary",
+          "erp-sqlserver__fr_complete_period_cycle_distribution",
+          "erp-sqlserver__fr_complete_period_reference_cycle_distribution",
+          "erp-sqlserver__fr_complete_period_completion_rate",
+          "erp-sqlserver__production_list",
+          "erp-sqlserver__purchase_schedule_list",
+          "erp-sqlserver__sampleshedule_list",
+          "erp-sqlserver__sampleshedule_risk",
+          "erp-sqlserver__factory_list",
+          "erp-sqlserver__oa_shipping_bank_payment_report",
+          "erp-sqlserver__oa_bank_payment_list"
+    ],
+    "automation_allow": [
+          "erp-sqlserver__fr_complete_period_list",
+          "erp-sqlserver__fr_complete_period_summary",
+          "erp-sqlserver__fr_complete_period_cycle_distribution",
+          "erp-sqlserver__fr_complete_period_reference_cycle_distribution",
+          "erp-sqlserver__fr_complete_period_completion_rate",
+          "erp-sqlserver__production_list",
+          "erp-sqlserver__purchase_schedule_list",
+          "erp-sqlserver__sampleshedule_list",
+          "erp-sqlserver__sampleshedule_risk",
+          "erp-sqlserver__factory_list",
+          "erp-sqlserver__oa_shipping_bank_payment_report",
+          "erp-sqlserver__oa_bank_payment_list"
+    ]
+  }
+}
