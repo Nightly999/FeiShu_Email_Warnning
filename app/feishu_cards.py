@@ -196,13 +196,16 @@ def build_answer_card(
     answer: str,
     *,
     status: str = "success",
+    title: str | None = None,
+    footer_label: str = "问题",
 ) -> dict[str, Any]:
     content = normalize_answer_for_card(answer)
-    template, title = {
+    template, default_title = {
         "success": ("green", "查询结果"),
         "error": ("red", "处理失败"),
         "denied": ("orange", "权限提示"),
     }.get(status, ("green", "查询结果"))
+    card_title = title or default_title
     dynamic_elements = _enforce_table_limit(_build_dynamic_elements(content))
     dynamic_elements = _limit_elements_preserving_tail(
         dynamic_elements, MAX_CARD_ELEMENTS - 2
@@ -212,7 +215,10 @@ def build_answer_card(
         {"tag": "hr"},
         {
             "tag": "markdown",
-            "content": f"<font color=\"grey\">问题：{escape_lark_md(trim_text(question, 160))}</font>",
+            "content": (
+                f"<font color=\"grey\">{escape_lark_md(footer_label)}："
+                f"{escape_lark_md(trim_text(question, 160))}</font>"
+            ),
         },
     ]
     return {
@@ -220,7 +226,7 @@ def build_answer_card(
         "config": {"wide_screen_mode": True, "update_multi": True},
         "header": {
             "template": template,
-            "title": {"tag": "plain_text", "content": title},
+            "title": {"tag": "plain_text", "content": card_title},
         },
         "body": {"elements": elements},
     }

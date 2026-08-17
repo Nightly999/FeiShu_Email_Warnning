@@ -1,0 +1,49 @@
+{
+  "apps": {
+    "asi-wip": {
+      "appId": "cli_aa84613e66f51bd8",
+      "appSecret": "ZbcBg92ytwPQVRF26pq7ShxeD06i2pDF",
+      "name": "ASI生产WIP助手"
+    },
+    "asi-wip-weijie": {
+      "appId": "cli_aac971b885f89bda",
+      "appSecret": "DFaNabeDlcVRVTWzgmBNfbR6Y5Ru4yry",
+      "name": "上海维杰服饰-ASI生产WIP助手"
+    },
+    "asi-wip-yuantong": {
+      "appId": "cli_aac970af31791bc1",
+      "appSecret": "nDOc3ljhlp6iyebbsnFLNdzQsKqiCPUE",
+      "name": "淮安源通制帽-ASI生产WIP助手"
+    },
+    "asi-wip-weide": {
+      "appId": "cli_aac977b74478dbc2",
+      "appSecret": "RTQyotOXM2u1wNsgWNuuTbmAbmz8BnT4",
+      "name": "淮安伟德服饰-ASI生产WIP助手"
+    },
+    "asi-wip-yuanda": {
+      "appId": "cli_aac97695d4f89be4",
+      "appSecret": "T37JUyny6sL6CEsaszCMtfYnGt05kQcS",
+      "name": "淮安远达服饰-ASI生产WIP助手"
+    },
+    "asi-wip-chuangshiji": {
+      "appId": "cli_aac975261978dbe9",
+      "appSecret": "Ca6A19TzV7au08AggT0mwdG6mOOebPo7",
+      "name": "淮安创世纪服饰-ASI生产WIP助手"
+    },
+    "asi-wip-fantai": {
+      "appId": "cli_aac97b0ffbb85bc9",
+      "appSecret": "OvsYe2eFGREvhAAuPZaJ9OhnxuIRYUjw",
+      "name": "上海泛太制帽-ASI生产WIP助手"
+    },
+    "asi-wip-yayuan": {
+      "appId": "cli_aacca1cfbeb7dbd5",
+      "appSecret": "WU1SpDIwRkSTTUjlnxInuAlmjLWGWm78",
+      "name": "江苏亚源-ASI生产WIP助手"
+    },
+    "asi-wip-shanghaiyayuan": {
+      "appId": "cli_aae3ecdac4f8dbee",
+      "appSecret": "uqw21sijVkVIwbT8YptGddfr4yuCX0Ah",
+      "name": "上海亚源-ASI生产WIP助手"
+    }
+  }
+}

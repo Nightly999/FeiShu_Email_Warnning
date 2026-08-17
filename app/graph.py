@@ -293,6 +293,8 @@ async def tools_node(state: AgentState) -> AgentState:
             else:
                 content = await McpClient().call_tool(tool_name, protected_args)
                 status = summarize_tool_result(tool_name, content)
+                if status.get("denied"):
+                    answer_status = "denied"
                 content_for_model = protect_tool_result_for_model(tool_name, content, status)
                 cache_id = await save_tool_result(
                     request_id=state["request_id"],
@@ -380,6 +382,12 @@ def summarize_tool_result(tool_name: str | None, content: str) -> dict[str, Any]
         return status
 
     rows = payload.get("rows") if isinstance(payload, dict) else None
+    authorization = payload.get("authorization") if isinstance(payload, dict) else None
+    if isinstance(authorization, dict) and authorization.get("authorized") is False:
+        status["denied"] = True
+        status["final_answer"] = payload.get("finalAnswer") or authorization.get(
+            "message"
+        )
     if isinstance(rows, list):
         status["row_count"] = len(rows)
         status["has_rows"] = len(rows) > 0

@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from contextlib import closing
 from pathlib import Path
+from unittest.mock import patch
 
 from app.bootstrap import bootstrap
 from app.event_dedup import claim_event, finish_event
@@ -14,8 +15,9 @@ from app.feishu import (
     normalize_event,
 )
 from app.identity import Identity
+from app.graph import summarize_tool_result
 from app.logging_security import redact_sensitive_text
-from app.policy import check_agent_access
+from app.policy import check_agent_access, check_tool_access
 from app.settings import get_settings
 
 
@@ -64,7 +66,7 @@ class SecurityBoundaryTests(unittest.TestCase):
         event = normalize_event(payload, app, trust_event_tenant=True)
         self.assertEqual(event["tenant_key"], "feishu-tenant")
 
-    def test_permission_errors_fail_closed(self) -> None:
+    def test_general_chat_does_not_require_customer_permission(self) -> None:
         identity = Identity(
             tenant_key="trusted-tenant",
             app_id="trusted-app",
@@ -72,7 +74,75 @@ class SecurityBoundaryTests(unittest.TestCase):
             internal_username="known-user",
             permissions={"permission_user_customers_error": "upstream unavailable"},
         )
-        self.assertFalse(check_agent_access(identity).allowed)
+        self.assertTrue(check_agent_access(identity).allowed)
+
+    def test_inventory_defers_authorization_to_mcp(self) -> None:
+        identity = Identity(
+            tenant_key="trusted-tenant",
+            app_id="trusted-app",
+            open_id="ou_example",
+            permissions={
+                "permission_user_customers": {
+                    "authorized": False,
+                    "finalAnswer": "客户权限未授权",
+                }
+            },
+        )
+        with patch(
+            "app.policy.get_allowed_tool_names",
+            return_value={"inventory_shortage_analysis"},
+        ):
+            result = check_tool_access(identity, "inventory_shortage_analysis", {})
+        self.assertTrue(result.allowed)
+
+    def test_wip_production_defers_authorization_to_mcp(self) -> None:
+        identity = Identity(
+            tenant_key="trusted-tenant",
+            app_id="trusted-app",
+            open_id="ou_example",
+            permissions={
+                "permission_user_customers": {
+                    "authorized": False,
+                    "finalAnswer": "客户权限未授权",
+                }
+            },
+        )
+        with patch(
+            "app.policy.get_allowed_tool_names",
+            return_value={"production_list"},
+        ):
+            result = check_tool_access(identity, "production_list", {})
+        self.assertTrue(result.allowed)
+        self.assertIn("MCP", result.reason)
+
+    def test_all_allowed_business_tools_defer_authorization_to_mcp(self) -> None:
+        identity = Identity(
+            tenant_key="trusted-tenant",
+            app_id="trusted-app",
+            open_id="ou_example",
+            permissions={
+                "permission_user_customers": {
+                    "authorized": False,
+                    "finalAnswer": "客户权限未授权",
+                }
+            },
+        )
+        with patch(
+            "app.policy.get_allowed_tool_names",
+            return_value={"purchase_schedule_list"},
+        ):
+            result = check_tool_access(identity, "purchase_schedule_list", {})
+        self.assertTrue(result.allowed)
+        self.assertIn("MCP", result.reason)
+
+    def test_mcp_denial_is_recognized_for_permission_card(self) -> None:
+        status = summarize_tool_result(
+            "inventory_shortage_analysis",
+            '{"rows":[],"authorization":{"authorized":false},'
+            '"finalAnswer":"没有权限访问"}',
+        )
+        self.assertTrue(status["denied"])
+        self.assertEqual(status["final_answer"], "没有权限访问")
 
     def test_sensitive_log_values_are_redacted(self) -> None:
         value = (
