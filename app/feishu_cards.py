@@ -8,6 +8,8 @@ MAX_CARD_TEXT_LENGTH = 5500
 MAX_CARD_ELEMENTS = 24
 MAX_TABLE_COMPONENTS = 5
 MAX_TABLE_COLUMNS = 50
+# Feishu table page_size only supports [1, 10]. Load up to 20 rows so the card
+# shows built-in ↑↓ pagination (e.g. 1/2) instead of asking users to type commands.
 TABLE_PAGE_SIZE = 10
 MAX_TABLE_ROWS = 20
 
@@ -45,7 +47,7 @@ def build_table_component(headers: list[str], rows: list[list[str]], index: int)
     return {
         "tag": "table",
         "element_id": f"table_{index}",
-        "page_size": min(max(len(row_objects), 1), TABLE_PAGE_SIZE),
+        "page_size": TABLE_PAGE_SIZE,
         "row_height": "low",
         "freeze_first_column": True,
         "columns": [

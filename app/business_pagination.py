@@ -298,7 +298,7 @@ def format_business_page(
     headers = all_headers[:max_data_columns]
     table_headers = ["序号", *headers]
     lines = [
-        f"业务明细（第 {page}/{total_pages} 批，共 {total_rows} 条；卡片内每页 10 条）",
+        f"业务明细（第 {page}/{total_pages} 批，共 {total_rows} 条）",
         "| " + " | ".join(escape_cell(header) for header in table_headers) + " |",
         "|" + "|".join("---" for _ in table_headers) + "|",
     ]

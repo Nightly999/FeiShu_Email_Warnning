@@ -10,7 +10,7 @@ from langgraph.graph import END, StateGraph
 from app.answers import AnswerResult, AnswerStatus
 from app.agent_skills import load_agent_skills_prompt
 from app.audit import write_audit
-from app.business_pagination import register_business_result, render_business_page
+from app.business_pagination import register_business_result
 from app.export_context import save_export_context
 from app.identity import Identity, load_business_permissions, resolve_identity
 from app.memory.service import build_memory_prompt, record_agent_exchange
@@ -111,25 +111,6 @@ async def run_agent(event: dict[str, Any]) -> AnswerResult:
             content=result.get("final_answer") or "已处理。",
             status=result.get("answer_status") or "success",
         )
-        if (
-            not event.get("_automation_run")
-            and int(result.get("latest_tool_row_count") or 0)
-            > get_settings().business_list_page_size
-        ):
-            page = await render_business_page(
-                tenant_key=event["tenant_key"],
-                app_id=event["app_id"],
-                open_id=event["open_id"],
-                chat_id=event.get("chat_id"),
-                session_id=session_id,
-                page=1,
-                expected_result_id=result.get("latest_tool_result_id"),
-            )
-            if page:
-                answer = AnswerResult(
-                    content=f"{answer.content}\n\n{page}",
-                    status=answer.status,
-                )
     except Exception:  # noqa: BLE001
         logger.exception(
             "Agent execution failed: request_id=%s bot_code=%s message_id=%s",
@@ -375,7 +356,13 @@ async def final_node(state: AgentState) -> AgentState:
 
 
 def summarize_tool_result(tool_name: str | None, content: str) -> dict[str, Any]:
-    status: dict[str, Any] = {"tool_name": tool_name, "has_rows": False, "row_count": 0}
+    status: dict[str, Any] = {
+        "tool_name": tool_name,
+        "has_rows": False,
+        "row_count": 0,
+        "total_count": 0,
+        "will_paginate": False,
+    }
     try:
         payload = json.loads(content)
     except (TypeError, json.JSONDecodeError):
@@ -391,21 +378,42 @@ def summarize_tool_result(tool_name: str | None, content: str) -> dict[str, Any]
     if isinstance(rows, list):
         status["row_count"] = len(rows)
         status["has_rows"] = len(rows) > 0
+        status["total_count"] = len(rows)
     elif isinstance(payload, dict):
         row_count = payload.get("rowCount") or payload.get("count") or payload.get("total")
         if isinstance(row_count, int):
             status["row_count"] = row_count
+            status["total_count"] = row_count
             status["has_rows"] = row_count > 0
+    if isinstance(payload, dict):
+        try:
+            total_count = int(payload["totalCount"])
+        except (KeyError, TypeError, ValueError):
+            total_count = int(status.get("total_count") or 0)
+        else:
+            status["total_count"] = total_count
+            if total_count > 0:
+                status["has_rows"] = True
+        status["will_paginate"] = total_count > get_settings().business_list_page_size
     return status
 
 
 def protect_tool_result_for_model(tool_name: str | None, content: str, status: dict[str, Any]) -> str:
     if not status.get("has_rows"):
         return content
+    total_count = status.get("total_count") or status.get("row_count") or 0
+    page_rows = status.get("row_count") or 0
     prefix = (
-        f"工具 {tool_name} 已成功返回 {status.get('row_count')} 条数据。"
+        f"工具 {tool_name} 已成功返回 {total_count} 条数据。"
         "必须基于 rows 字段整理结果；不得回答未查询到、无数据或不存在。"
+        f"请用中文 Markdown 表格展示本批最多 {page_rows} 条（字段用业务中文名）。"
+        "飞书卡片表格会自带上下翻页，不要引导用户用聊天口令翻页。"
     )
+    if status.get("will_paginate"):
+        prefix += (
+            f"若总数大于本批条数，正文只需说明“共有 {total_count} 条，以下是最近的 {page_rows} 条”，"
+            "不要再给聊天翻页口令。"
+        )
     return f"{prefix}\n\n{content}"
 
 

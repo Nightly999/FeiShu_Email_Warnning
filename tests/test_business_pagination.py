@@ -145,11 +145,11 @@ class BusinessPaginationTests(unittest.IsolatedAsyncioTestCase):
         second = await self.render(direction="next")
         boundary = await self.render(direction="next")
 
-        self.assertIn("第 1/2 批，共 23 条；卡片内每页 10 条", first)
+        self.assertIn("第 1/2 批，共 23 条", first)
         self.assertIn("MO-001", first)
         self.assertIn("MO-020", first)
         self.assertNotIn("MO-021", first)
-        self.assertIn("第 2/2 批，共 23 条；卡片内每页 10 条", second)
+        self.assertIn("第 2/2 批，共 23 条", second)
         self.assertIn("MO-021", second)
         self.assertIn("MO-023", second)
         self.assertIn("已经是最后一批", boundary)
@@ -196,7 +196,7 @@ class BusinessPaginationTests(unittest.IsolatedAsyncioTestCase):
 
         page = await self.render()
 
-        self.assertIn("第 1/1 批，共 2 条；卡片内每页 10 条", page)
+        self.assertIn("第 1/1 批，共 2 条", page)
         self.assertIn("新结果", page)
         self.assertNotIn("旧结果", page)
 

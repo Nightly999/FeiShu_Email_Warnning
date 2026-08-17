@@ -1,3 +1,4 @@
+import json
 import os
 import sqlite3
 import tempfile
@@ -145,6 +146,28 @@ class SecurityBoundaryTests(unittest.TestCase):
         )
         self.assertTrue(status["denied"])
         self.assertEqual(status["final_answer"], "没有权限访问")
+
+    def test_paginated_tool_result_uses_card_table_pager(self) -> None:
+        from app.graph import protect_tool_result_for_model
+
+        status = summarize_tool_result(
+            "oa_pending_form_list",
+            json.dumps(
+                {
+                    "rows": [{"TaskId": 1}] * 20,
+                    "page": 1,
+                    "pageSize": 20,
+                    "totalCount": 128,
+                    "totalPages": 7,
+                }
+            ),
+        )
+        self.assertTrue(status["will_paginate"])
+        protected = protect_tool_result_for_model("oa_pending_form_list", "{}", status)
+        self.assertIn("Markdown 表格", protected)
+        self.assertIn("上下翻页", protected)
+        self.assertIn("不要引导用户用聊天口令翻页", protected)
+        self.assertNotIn("可发送", protected)
 
     def test_sensitive_log_values_are_redacted(self) -> None:
         value = (
