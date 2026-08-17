@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from contextlib import closing
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from app.bootstrap import bootstrap
 from app.event_dedup import claim_event, finish_event
@@ -19,6 +19,8 @@ from app.graph import summarize_tool_result
 from app.logging_security import redact_sensitive_text
 from app.policy import check_agent_access, check_tool_access
 from app.settings import get_settings
+from app.feishu_cards import build_welcome_card
+from app.welcome import send_daily_welcome_once
 
 
 def tenant_app() -> TenantApp:
@@ -250,6 +252,73 @@ class LegacyDatabaseMigrationTests(unittest.IsolatedAsyncioTestCase):
                 restore_environment("APP_DATABASE_PATH", previous_db_path)
                 restore_environment("FEISHU_APPS_CONFIG_PATH", previous_apps_path)
                 restore_environment("APP_ENV", previous_app_env)
+
+
+class WelcomeMessageTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory(dir=Path.cwd())
+        self.previous_db_path = os.environ.get("APP_DATABASE_PATH")
+        self.previous_reply_enabled = os.environ.get("FEISHU_REPLY_ENABLED")
+        self.previous_apps_path = os.environ.get("FEISHU_APPS_CONFIG_PATH")
+        self.previous_app_env = os.environ.get("APP_ENV")
+        os.environ["APP_DATABASE_PATH"] = str(Path(self.temp_dir.name) / "agent.db")
+        os.environ["FEISHU_APPS_CONFIG_PATH"] = str(
+            Path(self.temp_dir.name) / "missing-apps.json"
+        )
+        os.environ["FEISHU_REPLY_ENABLED"] = "true"
+        os.environ["APP_ENV"] = "production"
+        get_settings.cache_clear()
+        await bootstrap()
+
+    async def asyncTearDown(self) -> None:
+        get_settings.cache_clear()
+        restore_environment("APP_DATABASE_PATH", self.previous_db_path)
+        restore_environment("FEISHU_REPLY_ENABLED", self.previous_reply_enabled)
+        restore_environment("FEISHU_APPS_CONFIG_PATH", self.previous_apps_path)
+        restore_environment("APP_ENV", self.previous_app_env)
+        self.temp_dir.cleanup()
+
+    async def test_welcome_message_is_sent_once_per_user_per_day(self) -> None:
+        app = tenant_app()
+        event = {
+            "tenant_key": app.tenant_key,
+            "app_id": app.app_id,
+            "bot_code": app.bot_code,
+            "chat_id": "oc_chat",
+            "open_id": "ou_example",
+        }
+        with patch("app.welcome.send_card", new_callable=AsyncMock) as send_card:
+            send_card.return_value = "om_welcome"
+            self.assertTrue(await send_daily_welcome_once(app, event))
+            self.assertFalse(await send_daily_welcome_once(app, event))
+
+        self.assertEqual(send_card.await_count, 1)
+        card = send_card.await_args.args[2]
+        self.assertEqual(card["schema"], "2.0")
+        self.assertEqual(card["header"]["title"]["content"], "ASI采购库存查询助手 📋")
+        self.assertIn("库存查询与分析", str(card))
+
+    async def test_welcome_message_retries_after_send_failure(self) -> None:
+        app = tenant_app()
+        event = {
+            "tenant_key": app.tenant_key,
+            "app_id": app.app_id,
+            "bot_code": app.bot_code,
+            "chat_id": "oc_chat",
+            "open_id": "ou_example",
+        }
+        with patch("app.welcome.send_card", new_callable=AsyncMock) as send_card:
+            send_card.side_effect = [RuntimeError("send failed"), "om_welcome"]
+            self.assertFalse(await send_daily_welcome_once(app, event))
+            self.assertTrue(await send_daily_welcome_once(app, event))
+
+        self.assertEqual(send_card.await_count, 2)
+
+    def test_welcome_card_uses_interactive_card_format(self) -> None:
+        card = build_welcome_card()
+        self.assertEqual(card["schema"], "2.0")
+        self.assertTrue(card["config"]["wide_screen_mode"])
+        self.assertGreaterEqual(len(card["body"]["elements"]), 6)
 
 
 def restore_environment(key: str, value: str | None) -> None:

@@ -12,7 +12,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Iterator
-
+from collections.abc import Coroutine
 import lark_oapi as lark
 from lark_oapi.api.im.v1 import (
     P2ImChatAccessEventBotP2pChatEnteredV1,
@@ -40,6 +40,7 @@ from app.logging_security import install_sensitive_log_filter
 from app.memory.sessions import get_active_session_id
 from app.scheduler import start_scheduler_thread
 from app.settings import get_settings
+from app.welcome import send_daily_welcome_once
 
 
 logger = logging.getLogger("feishu_ws")
@@ -198,6 +199,22 @@ def is_process_alive(pid: int) -> bool:
         return False
     return True
 
+def run_callback_coro(coro: Coroutine[Any, Any, Any], *, label: str, bot_code: str) -> None:
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        asyncio.run(coro)
+        return
+
+    task = loop.create_task(coro)
+
+    def log_failure(done: asyncio.Task[Any]) -> None:
+        try:
+            done.result()
+        except Exception:
+            logger.exception("Async callback failed: label=%s bot_code=%s", label, bot_code)
+
+    task.add_done_callback(log_failure)
 
 async def load_apps() -> list[TenantApp]:
     await bootstrap()
@@ -253,13 +270,20 @@ def run_client_process(app_payload: dict[str, Any]) -> None:
     def handle_bot_p2p_entered(data: P2ImChatAccessEventBotP2pChatEnteredV1) -> None:
         try:
             payload = json.loads(lark.JSON.marshal(data))
-            event = payload.get("event") or {}
-            operator = event.get("operator_id") or {}
+            if not event_scope_matches(payload, app, allow_unconfigured_tenant=True):
+                logger.warning("Ignore entered event with mismatched tenant scope: bot_code=%s", app.bot_code)
+                return
+            event = normalize_event(payload, app, trust_event_tenant=True)
             logger.info(
                 "User opened bot chat: bot_code=%s open_id=%s chat_id=%s",
                 app.bot_code,
-                operator.get("open_id"),
+                event.get("open_id"),
                 event.get("chat_id"),
+            )
+            run_callback_coro(
+                send_daily_welcome_once(app, event),
+                label="daily_welcome",
+                bot_code=app.bot_code,
             )
         except Exception:
             logger.exception("Failed to handle bot chat entered event: bot_code=%s", app.bot_code)

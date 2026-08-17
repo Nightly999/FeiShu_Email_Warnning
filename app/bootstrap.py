@@ -252,6 +252,21 @@ CREATE TABLE IF NOT EXISTS uploaded_file (
 
 CREATE INDEX IF NOT EXISTS idx_uploaded_file_lookup
 ON uploaded_file (tenant_key, app_id, open_id, chat_id, session_id, id);
+
+CREATE TABLE IF NOT EXISTS welcome_delivery (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  tenant_key TEXT NOT NULL,
+  app_id TEXT NOT NULL,
+  bot_code TEXT,
+  chat_id TEXT NOT NULL,
+  open_id TEXT NOT NULL,
+  delivery_date TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE (tenant_key, app_id, chat_id, open_id, delivery_date)
+);
+
+CREATE INDEX IF NOT EXISTS idx_welcome_delivery_lookup
+ON welcome_delivery (tenant_key, app_id, chat_id, open_id, delivery_date);
 """
 
 
@@ -402,6 +417,7 @@ async def import_feishu_apps(db) -> None:
 
     payload = json.loads(config_path.read_text(encoding="utf-8"))
     apps = payload.get("apps", payload)
+    configured_codes = list(apps.keys())
     for bot_code, app_config in apps.items():
         tenant_key = app_config.get("tenantKey") or app_config.get("tenant_key") or ""
         app_id = app_config["appId"]
@@ -426,6 +442,20 @@ async def import_feishu_apps(db) -> None:
             """,
             (tenant_key, app_id, app_secret, encrypt_key, verification_token, bot_code, name),
         )
+
+    # Config file is the source of truth: disable bots removed from the file.
+    if configured_codes:
+        placeholders = ", ".join("?" for _ in configured_codes)
+        await db.execute(
+            f"""
+            UPDATE feishu_tenant_app
+            SET enabled = 0
+            WHERE bot_code NOT IN ({placeholders})
+            """,
+            configured_codes,
+        )
+    else:
+        await db.execute("UPDATE feishu_tenant_app SET enabled = 0")
 
 
 if __name__ == "__main__":

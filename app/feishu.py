@@ -277,6 +277,8 @@ async def send_message(app: TenantApp, receive_id: str, *, msg_type: str, conten
         )
         response.raise_for_status()
         data = response.json()
+    if data.get("code") not in (0, None):
+        raise ValueError(f"Feishu send message error: {data}")
     return ((data.get("data") or {}).get("message_id") or (data.get("data") or {}).get("messageId"))
 
 

@@ -191,6 +191,78 @@ def build_processing_card(question: str) -> dict[str, Any]:
     }
 
 
+def build_welcome_card() -> dict[str, Any]:
+    return {
+        "schema": "2.0",
+        "config": {"wide_screen_mode": True, "update_multi": True},
+        "header": {
+            "template": "green",
+            "title": {"tag": "plain_text", "content": "ASI采购库存查询助手 📋"},
+        },
+        "body": {
+            "elements": [
+                {
+                    "tag": "markdown",
+                    "content": (
+                        "我是 **ASI采购库存查询助手**，专注工厂订单和样品的在制品跟踪。"
+                        "你可以直接告诉我查询、分析、导出或定时推送需求。"
+                    ),
+                },
+                {"tag": "hr"},
+                {
+                    "tag": "markdown",
+                    "content": (
+                        "**📦 库存查询与分析**\n"
+                        "- 查询集团 ERP、事业一部 / 二部 ERP、越南 ERP 库存数据\n"
+                        "- 按集团色号、存货大类、名称、规格、颜色等条件筛选\n"
+                        "- 查看生产订单需求、规划需求、MRP / 非 MRP 库存、采购在途、请购量等"
+                    ),
+                },
+                {
+                    "tag": "markdown",
+                    "content": (
+                        "**📊 核心指标监控**\n"
+                        "- 库存汇总概览\n"
+                        "- 安全库存预警（可用量低于警戒点）\n"
+                        "- 库存短缺分析（净缺口分析）"
+                    ),
+                },
+                {
+                    "tag": "markdown",
+                    "content": (
+                        "**📈 采购与生产**\n"
+                        "- 按系统和存货大类汇总采购数据\n"
+                        "- 采购订单执行进度统计\n"
+                        "- 生产进度报告查询"
+                    ),
+                },
+                {
+                    "tag": "markdown",
+                    "content": (
+                        "**📤 数据导出**\n"
+                        "- 可以把查询结果导出 Excel 并通过飞书发给你"
+                    ),
+                },
+                {
+                    "tag": "markdown",
+                    "content": (
+                        "**⏰ 定时数据推送**\n"
+                        "- 可以设置推送时间，自动将查询结果通过飞书发送给你"
+                    ),
+                },
+                {"tag": "hr"},
+                {
+                    "tag": "markdown",
+                    "content": (
+                        "💡 **示例**：查一下集团 ERP 里色号 XXX 的库存\n"
+                        "💡 **示例**：看看有哪些物料安全库存不足"
+                    ),
+                },
+            ]
+        },
+    }
+
+
 def build_answer_card(
     question: str,
     answer: str,
