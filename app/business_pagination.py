@@ -8,7 +8,7 @@ import uuid
 from typing import Any, Literal
 
 from app.db import fetch_one, open_db
-from app.identity import load_business_permissions, resolve_identity
+from app.identity import resolve_identity
 from app.mcp_client import McpClient
 from app.policy import check_agent_access, check_tool_access, inject_identity_args
 from app.settings import get_settings
@@ -200,7 +200,6 @@ async def fetch_remote_page(
         union_id=None,
         user_id=None,
     )
-    identity = await load_business_permissions(identity)
     agent_policy = check_agent_access(identity)
     if not agent_policy.allowed:
         return agent_policy.reason

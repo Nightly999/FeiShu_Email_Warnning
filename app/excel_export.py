@@ -10,7 +10,7 @@ from openpyxl import Workbook
 
 from app.business_pagination import extract_pagination
 from app.export_context import get_latest_export_context
-from app.identity import load_business_permissions, resolve_identity
+from app.identity import resolve_identity
 from app.mcp_client import McpClient
 from app.policy import check_agent_access, check_tool_access, inject_identity_args
 from app.tool_result_cache import get_tool_result_by_id
@@ -88,7 +88,6 @@ async def load_complete_tool_rows(cached: dict[str, Any]) -> list[dict[str, Any]
         union_id=None,
         user_id=None,
     )
-    identity = await load_business_permissions(identity)
     agent_policy = check_agent_access(identity)
     if not agent_policy.allowed:
         logger.warning("Remote export denied: %s", agent_policy.reason)

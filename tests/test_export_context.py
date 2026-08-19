@@ -255,10 +255,6 @@ class SessionScopedExportTests(unittest.IsolatedAsyncioTestCase):
                 "app.excel_export.resolve_identity", AsyncMock(return_value=identity)
             ),
             patch(
-                "app.excel_export.load_business_permissions",
-                AsyncMock(return_value=identity),
-            ),
-            patch(
                 "app.excel_export.check_agent_access",
                 return_value=PolicyResult(True, "ok"),
             ),

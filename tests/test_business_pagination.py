@@ -227,10 +227,6 @@ class BusinessPaginationTests(unittest.IsolatedAsyncioTestCase):
                 AsyncMock(return_value=identity),
             ),
             patch(
-                "app.business_pagination.load_business_permissions",
-                AsyncMock(return_value=identity),
-            ),
-            patch(
                 "app.business_pagination.check_agent_access",
                 return_value=PolicyResult(True, "ok"),
             ),
@@ -260,10 +256,6 @@ class BusinessPaginationTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch(
                 "app.business_pagination.resolve_identity",
-                AsyncMock(return_value=identity),
-            ),
-            patch(
-                "app.business_pagination.load_business_permissions",
                 AsyncMock(return_value=identity),
             ),
             patch(

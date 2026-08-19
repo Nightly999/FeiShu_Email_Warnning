@@ -12,7 +12,7 @@ from app.agent_skills import load_agent_skills_prompt
 from app.audit import write_audit
 from app.business_pagination import register_business_result
 from app.export_context import save_export_context
-from app.identity import Identity, load_business_permissions, resolve_identity
+from app.identity import Identity, resolve_identity
 from app.memory.service import build_memory_prompt, record_agent_exchange
 from app.memory.sessions import get_active_session_id
 from app.models.router import ModelFallbackError, invoke_chat_with_fallback
@@ -135,7 +135,6 @@ async def resolve_identity_node(state: AgentState) -> AgentState:
         union_id=state.get("union_id"),
         user_id=state.get("user_id"),
     )
-    identity = await load_business_permissions(identity)
     logger.info(
         "Identity resolved: request_id=%s bot_code=%s message_id=%s tenant_key=%s app_id=%s open_id=%s username=%s known=%s",
         state["request_id"],
