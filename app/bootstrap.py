@@ -446,22 +446,54 @@ async def import_feishu_apps(db) -> None:
         encrypt_key = app_config.get("encryptKey") or app_config.get("encrypt_key")
         verification_token = app_config.get("verificationToken") or app_config.get("verification_token")
 
-        await db.execute(
-            """
-            INSERT INTO feishu_tenant_app (
-              tenant_key, app_id, app_secret, encrypt_key, verification_token, bot_code, bot_name, enabled
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, 1)
-            ON CONFLICT(bot_code) DO UPDATE SET
-              tenant_key = excluded.tenant_key,
-              app_id = excluded.app_id,
-              app_secret = excluded.app_secret,
-              encrypt_key = excluded.encrypt_key,
-              verification_token = excluded.verification_token,
-              bot_name = excluded.bot_name,
-              enabled = 1
-            """,
-            (tenant_key, app_id, app_secret, encrypt_key, verification_token, bot_code, name),
+        identity_cursor = await db.execute(
+            "SELECT id, bot_code FROM feishu_tenant_app "
+            "WHERE tenant_key = ? AND app_id = ?",
+            (tenant_key, app_id),
         )
+        identity_row = await identity_cursor.fetchone()
+        code_cursor = await db.execute(
+            "SELECT id, tenant_key, app_id FROM feishu_tenant_app WHERE bot_code = ?",
+            (bot_code,),
+        )
+        code_row = await code_cursor.fetchone()
+        if identity_row and code_row and identity_row["id"] != code_row["id"]:
+            raise ValueError(
+                f"飞书应用配置冲突：bot_code={bot_code!r} 已关联其他应用，"
+                f"同时 tenant_key={tenant_key!r}, app_id={app_id!r} 也已有记录。"
+                "请检查 config/feishu_apps.local.json 中是否配置了重复应用。"
+            )
+
+        existing_row = identity_row or code_row
+        values = (
+            tenant_key,
+            app_id,
+            app_secret,
+            encrypt_key,
+            verification_token,
+            bot_code,
+            name,
+        )
+        if existing_row:
+            await db.execute(
+                """
+                UPDATE feishu_tenant_app
+                SET tenant_key = ?, app_id = ?, app_secret = ?, encrypt_key = ?,
+                    verification_token = ?, bot_code = ?, bot_name = ?, enabled = 1
+                WHERE id = ?
+                """,
+                (*values, existing_row["id"]),
+            )
+        else:
+            await db.execute(
+                """
+                INSERT INTO feishu_tenant_app (
+                  tenant_key, app_id, app_secret, encrypt_key, verification_token,
+                  bot_code, bot_name, enabled
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 1)
+                """,
+                values,
+            )
 
     # Config file is the source of truth: disable bots removed from the file.
     if configured_codes:
