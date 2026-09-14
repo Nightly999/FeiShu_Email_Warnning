@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import AsyncMock, patch
 
+from app.schedule_planner import SchedulePlan
 from app.scheduler import (
     PREVIOUS_QUERY_PROMPT,
     auto_task_name,
     execution_mode_for_prompt,
     parse_schedule_command,
+    recent_schedule_creation_request,
+    resolve_schedule_command,
     schedule_help_text,
 )
 
@@ -155,6 +159,83 @@ class ScheduleCommandTests(unittest.TestCase):
         invalid = parse_schedule_command("每1分钟提醒我检查待办")
         self.assertEqual(invalid["schedule_type"], "invalid")
         self.assertIn("5 分钟", invalid["error"])
+
+
+class AgentSchedulePlanningTests(unittest.IsolatedAsyncioTestCase):
+    async def test_standalone_mode_reply_uses_recent_pending_schedule_request(
+        self,
+    ) -> None:
+        event = {
+            "tenant_key": "tenant",
+            "app_id": "app",
+            "open_id": "user",
+            "chat_id": "chat",
+            "_session_id": "session",
+        }
+        original = "创建定时任务，每天 08:30 查询未完成工作"
+        turns = [
+            {"role": "user", "content": original},
+            {"role": "assistant", "content": "please select Agent or reminder mode"},
+        ]
+        with patch(
+            "app.scheduler.fetch_recent_turns",
+            AsyncMock(return_value=turns),
+        ):
+            request = await recent_schedule_creation_request(event)
+
+        self.assertEqual(request, original)
+
+    async def test_natural_creation_uses_agent_plan_instead_of_help(self) -> None:
+        plan = SchedulePlan(
+            action="create",
+            schedule_type="daily",
+            daily_time="08:30",
+            prompt="预计日期前三天还没有完成的通知我",
+            execution_mode="agent",
+        )
+        with patch(
+            "app.scheduler.plan_schedule_creation",
+            AsyncMock(return_value=plan),
+        ) as planner:
+            command = await resolve_schedule_command(
+                "创建定时任务 每天早上8：30开始执行内容是：预计日期前三天还没有完成的通知我"
+            )
+
+        self.assertEqual(
+            command,
+            {
+                "schedule_type": "daily",
+                "daily_time": "08:30",
+                "prompt": "预计日期前三天还没有完成的通知我",
+                "execution_mode": "agent",
+            },
+        )
+        planner.assert_awaited_once()
+
+    async def test_mode_reply_completes_quoted_creation_request(self) -> None:
+        plan = SchedulePlan(
+            action="create",
+            schedule_type="daily",
+            daily_time="08:30",
+            prompt="预计日期前三天还没有完成的通知我",
+            execution_mode="agent",
+        )
+        original = "创建定时任务 每天早上8：30执行：预计日期前三天还没有完成的通知我"
+        with patch(
+            "app.scheduler.plan_schedule_creation",
+            AsyncMock(return_value=plan),
+        ) as planner:
+            command = await resolve_schedule_command(
+                "Agent 模式",
+                referenced_request_text=original,
+            )
+
+        self.assertEqual(command["execution_mode"], "agent")
+        self.assertEqual(command["daily_time"], "08:30")
+        self.assertEqual(
+            planner.await_args.kwargs["original_request"],
+            original,
+        )
 
 
 if __name__ == "__main__":

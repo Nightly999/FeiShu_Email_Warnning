@@ -23,7 +23,7 @@ class ExportIntentDecision:
 
 def is_explicit_excel_export_request(text: str) -> bool:
     normalized = re.sub(r"\s+", "", (text or "").lower())
-    if "excel" not in normalized:
+    if not any(marker in normalized for marker in ("excel", "excle", "xlsx")):
         return False
     export_markers = (
         "导出",

@@ -38,6 +38,7 @@ from app.file_analysis import safe_resource_path
 from app.graph import run_agent
 from app.logging_security import install_sensitive_log_filter
 from app.memory.sessions import get_active_session_id
+from app.reply_context import hydrate_reply_context
 from app.scheduler import start_scheduler_thread
 from app.settings import get_settings
 from app.welcome import send_daily_welcome_once
@@ -184,20 +185,51 @@ def warn_stale_processes() -> None:
         clear_pid_file()
         return
 
-    logger.warning(
-        "Found possible stale Feishu websocket processes from previous run: %s. "
-        "If replies look old or duplicated, stop them with: Stop-Process -Id %s -Force",
-        ", ".join(str(pid) for pid in pids),
-        ",".join(str(pid) for pid in pids),
+    joined_pids = ",".join(str(pid) for pid in pids)
+    raise RuntimeError(
+        "Feishu websocket is already running with PID(s): "
+        f"{', '.join(str(pid) for pid in pids)}. "
+        f"Stop it first with: Stop-Process -Id {joined_pids} -Force"
     )
 
 
 def is_process_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        return is_windows_process_alive(pid)
     try:
         os.kill(pid, 0)
-    except OSError:
+    except (OSError, SystemError, ValueError):
         return False
     return True
+
+
+def is_windows_process_alive(pid: int) -> bool:
+    import ctypes
+    from ctypes import wintypes
+
+    process_query_limited_information = 0x1000
+    still_active = 259
+    error_access_denied = 5
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    handle = kernel32.OpenProcess(process_query_limited_information, False, pid)
+    if not handle:
+        return ctypes.get_last_error() == error_access_denied
+    try:
+        exit_code = wintypes.DWORD()
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+            return True
+        return exit_code.value == still_active
+    finally:
+        kernel32.CloseHandle(handle)
 
 def run_callback_coro(coro: Coroutine[Any, Any, Any], *, label: str, bot_code: str) -> None:
     try:
@@ -378,6 +410,7 @@ async def dispatch_event(app: TenantApp, event: dict[str, Any]) -> None:
             chat_id=event.get("chat_id"),
             bot_code=event.get("bot_code"),
         )
+        await hydrate_reply_context(app, event)
     if event.get("message_type") in {"file", "image", "media", "video"}:
         await handle_file_event(app, event)
         return
@@ -400,6 +433,7 @@ async def dispatch_event(app: TenantApp, event: dict[str, Any]) -> None:
     progress_message_id = None
     if event.get("message_id"):
         progress_message_id = await reply_card(app, event["message_id"], build_processing_card(event["text"]))
+        event["_reply_message_id"] = progress_message_id
     handled = await handle_builtin_text_command(app, event, progress_message_id)
     if handled:
         return
@@ -442,6 +476,7 @@ async def handle_file_event(app: TenantApp, event: dict[str, Any]) -> None:
         event.get("file_name"),
     )
     progress_message_id = await reply_card(app, message_id, build_processing_card(event.get("file_name") or "文件"))
+    event["_reply_message_id"] = progress_message_id
     path = safe_resource_path(message_id, event.get("file_name"), event.get("resource_type"))
     try:
         await download_message_file(

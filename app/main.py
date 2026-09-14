@@ -22,6 +22,7 @@ from app.feishu_cards import build_answer_card, build_processing_card, should_us
 from app.graph import run_agent
 from app.logging_security import install_sensitive_log_filter
 from app.memory.sessions import get_active_session_id
+from app.reply_context import hydrate_reply_context
 from app.settings import get_settings
 
 
@@ -115,6 +116,8 @@ async def feishu_events(
             bot_code=event.get("bot_code"),
         )
         event["_session_id"] = session_id
+        await hydrate_reply_context(tenant_app, event)
+        event["_reply_message_id"] = progress_message_id
         handled = await handle_builtin_text_command(
             tenant_app, event, progress_message_id
         )

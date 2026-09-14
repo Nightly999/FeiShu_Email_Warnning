@@ -7,8 +7,12 @@ from pathlib import Path
 from typing import Any
 
 from openpyxl import Workbook
+from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.utils import get_column_letter
+from openpyxl.worksheet.table import Table, TableStyleInfo
 
 from app.business_pagination import extract_pagination
+from app.excel_design import ExcelExportPlan, apply_excel_export_plan, plan_excel_export
 from app.export_context import get_latest_export_context
 from app.identity import resolve_identity
 from app.mcp_client import McpClient
@@ -27,6 +31,8 @@ async def export_latest_result_to_excel(
     open_id: str,
     chat_id: str | None,
     session_id: str,
+    request_text: str | None = None,
+    referenced_message_ids: list[str] | None = None,
 ) -> Path | None:
     context = await get_latest_export_context(
         tenant_key=tenant_key,
@@ -34,6 +40,7 @@ async def export_latest_result_to_excel(
         open_id=open_id,
         chat_id=chat_id,
         session_id=session_id,
+        referenced_message_ids=referenced_message_ids,
     )
     if not context:
         return None
@@ -66,11 +73,29 @@ async def export_latest_result_to_excel(
     if not rows:
         return None
 
+    plan: ExcelExportPlan | None = None
+    if request_text:
+        plan = await plan_excel_export(request_text, rows)
+        rows = apply_excel_export_plan(rows, plan)
+
     EXPORT_DIR.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"{cached.get('tool_name') or 'query_result'}_{timestamp}.xlsx"
+    design_suffix = (
+        f"_{plan.filename_suffix.strip()[:50]}"
+        if plan and plan.filename_suffix.strip()
+        else ""
+    )
+    filename = (
+        f"{cached.get('tool_name') or 'query_result'}"
+        f"{design_suffix}_{timestamp}.xlsx"
+    )
     path = EXPORT_DIR / safe_filename(filename)
-    write_rows_to_xlsx(rows, path)
+    write_rows_to_xlsx(
+        rows,
+        path,
+        sheet_name=plan.sheet_name if plan else "查询结果",
+        title=plan.title if plan else "",
+    )
     return path
 
 
@@ -238,7 +263,13 @@ def extract_rows(tool_result: str) -> list[dict[str, Any]]:
     return [row for row in rows if isinstance(row, dict)]
 
 
-def write_rows_to_xlsx(rows: list[dict[str, Any]], path: Path) -> None:
+def write_rows_to_xlsx(
+    rows: list[dict[str, Any]],
+    path: Path,
+    *,
+    sheet_name: str = "查询结果",
+    title: str = "",
+) -> None:
     headers: list[str] = []
     for row in rows:
         for key in row:
@@ -247,14 +278,52 @@ def write_rows_to_xlsx(rows: list[dict[str, Any]], path: Path) -> None:
 
     wb = Workbook()
     ws = wb.active
-    ws.title = "查询结果"
+    ws.title = safe_sheet_name(sheet_name)
+    header_row = 1
+    if title.strip():
+        ws.append([title.strip()])
+        header_row = 2
     ws.append(headers)
     for row in rows:
         ws.append([normalize_cell(row.get(header)) for header in headers])
 
+    if title.strip() and headers:
+        ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(headers))
+        title_cell = ws.cell(row=1, column=1)
+        title_cell.font = Font(size=14, bold=True, color="1F2937")
+        title_cell.alignment = Alignment(vertical="center")
+        ws.row_dimensions[1].height = 26
+
+    header_fill = PatternFill("solid", fgColor="1F4E78")
+    for cell in ws[header_row]:
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.fill = header_fill
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    ws.row_dimensions[header_row].height = 30
+    ws.freeze_panes = f"A{header_row + 1}"
+    ws.sheet_view.showGridLines = False
+
     for column_cells in ws.columns:
         length = max(len(str(cell.value or "")) for cell in column_cells)
-        ws.column_dimensions[column_cells[0].column_letter].width = min(max(length + 2, 10), 40)
+        column_letter = get_column_letter(column_cells[0].column)
+        ws.column_dimensions[column_letter].width = min(max(length + 2, 10), 40)
+        for cell in column_cells[header_row:]:
+            cell.alignment = Alignment(vertical="top", wrap_text=True)
+
+    if headers and rows:
+        end_column = get_column_letter(len(headers))
+        table = Table(
+            displayName="ExportData",
+            ref=f"A{header_row}:{end_column}{header_row + len(rows)}",
+        )
+        table.tableStyleInfo = TableStyleInfo(
+            name="TableStyleMedium2",
+            showFirstColumn=False,
+            showLastColumn=False,
+            showRowStripes=True,
+            showColumnStripes=False,
+        )
+        ws.add_table(table)
     wb.save(path)
 
 
@@ -268,3 +337,8 @@ def normalize_cell(value: Any) -> Any:
 
 def safe_filename(name: str) -> str:
     return "".join("_" if ch in '\\/:*?"<>|' else ch for ch in name)
+
+
+def safe_sheet_name(name: str) -> str:
+    cleaned = safe_filename(name).replace("[", "_").replace("]", "_").strip()
+    return (cleaned or "查询结果")[:31]

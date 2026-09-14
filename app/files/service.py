@@ -34,6 +34,8 @@ async def register_uploaded_file(event: dict, path: Path) -> str:
         source_type="uploaded_file",
         source_ref=str(path),
         source_name=event.get("file_name") or path.name,
+        request_message_id=event.get("message_id"),
+        reply_message_id=event.get("_reply_message_id"),
     )
     return build_upload_ack(path)
 
@@ -74,6 +76,8 @@ async def answer_from_recent_file(event: dict, text: str) -> str | None:
             {"answer": answer, "source_path": str(path)}, ensure_ascii=False
         ),
         source_name=latest.get("file_name") or path.name,
+        request_message_id=event.get("message_id"),
+        reply_message_id=event.get("_reply_message_id"),
     )
     return answer
 

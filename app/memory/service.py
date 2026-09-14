@@ -59,7 +59,10 @@ async def record_agent_exchange(
                 session_id=session_id,
                 role="user",
                 content=_clip(user_message, 2000),
-                metadata={"message_id": event.get("message_id")},
+                metadata={
+                    "message_id": event.get("message_id"),
+                    "parent_message_id": event.get("parent_id"),
+                },
             )
         if answer.strip():
             await add_conversation_turn(
@@ -67,7 +70,11 @@ async def record_agent_exchange(
                 session_id=session_id,
                 role="assistant",
                 content=_clip(answer, 2000),
-                metadata={"message_id": event.get("message_id")},
+                metadata={
+                    "message_id": event.get("_reply_message_id")
+                    or event.get("message_id"),
+                    "request_message_id": event.get("message_id"),
+                },
             )
     except Exception:
         logger.exception("Failed to record conversation memory")

@@ -10,6 +10,15 @@ from unittest.mock import AsyncMock, patch
 from openpyxl import load_workbook
 
 from app.bootstrap import bootstrap
+from app.excel_design import (
+    ExcelAggregation,
+    ExcelDeduplication,
+    ExcelExportPlan,
+    ExcelOutputColumn,
+    ExcelSort,
+    apply_excel_export_plan,
+    plan_excel_export,
+)
 from app.excel_export import export_latest_result_to_excel
 from app.export_context import save_export_context
 from app.identity import Identity
@@ -24,6 +33,9 @@ from app.tool_result_cache import save_tool_result
 
 
 class ExcelExportIntentTests(unittest.IsolatedAsyncioTestCase):
+    def test_common_excel_typo_is_recognized(self) -> None:
+        self.assertTrue(is_explicit_excel_export_request("整理成 excle 表给我"))
+
     def test_natural_export_requests_are_recognized(self) -> None:
         requests = (
             "导出 Excel",
@@ -81,6 +93,95 @@ class ExcelExportIntentTests(unittest.IsolatedAsyncioTestCase):
 
 
 class SessionScopedExportTests(unittest.IsolatedAsyncioTestCase):
+    async def test_model_designs_deduplication_using_real_dataset_column(self) -> None:
+        response = type(
+            "Response",
+            (),
+            {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "name": "design_excel_export",
+                        "args": {
+                            "sheet_name": "去重结果",
+                            "title": "",
+                            "filename_suffix": "样品号去重",
+                            "filters": [],
+                            "deduplicate": {
+                                "keys": ["样品单号"],
+                                "keep": "merge_unique",
+                                "include_count": True,
+                            },
+                            "group_by": [],
+                            "aggregations": [],
+                            "sort_by": [],
+                            "columns": [],
+                        },
+                    }
+                ],
+            },
+        )()
+        rows = [{"样品单号": "S001", "节点": "裁剪"}]
+        with patch(
+            "app.excel_design.invoke_chat_with_fallback",
+            AsyncMock(return_value=response),
+        ) as model:
+            plan = await plan_excel_export("把样品的号去重后生成 Excel", rows)
+
+        self.assertEqual(plan.deduplicate.keys, ["样品单号"])
+        request_payload = model.await_args.kwargs["messages"][1].content
+        self.assertIn("样品单号", request_payload)
+
+    def test_generic_deduplication_merges_distinct_values(self) -> None:
+        rows = [
+            {"样品单号": "S001", "客户简称": "NIKE", "节点": "打样 / 裁剪"},
+            {"样品单号": "S001", "客户简称": "NIKE", "节点": "打样 / 车缝"},
+            {"样品单号": "S002", "客户简称": "VUO", "节点": "确认 / 包装"},
+        ]
+        plan = ExcelExportPlan(
+            deduplicate=ExcelDeduplication(
+                keys=["样品单号"], keep="merge_unique", include_count=True
+            )
+        )
+
+        result = apply_excel_export_plan(rows, plan)
+
+        self.assertEqual(len(result), 2)
+        self.assertEqual(result[0]["样品单号"], "S001")
+        self.assertEqual(result[0]["客户简称"], "NIKE")
+        self.assertEqual(result[0]["节点"], "打样 / 裁剪；打样 / 车缝")
+        self.assertEqual(result[0]["合并记录数"], 2)
+
+    def test_generic_group_sort_and_column_design(self) -> None:
+        rows = [
+            {"客户": "B", "金额": 5, "单号": "B1"},
+            {"客户": "A", "金额": 10, "单号": "A1"},
+            {"客户": "A", "金额": 20, "单号": "A2"},
+        ]
+        plan = ExcelExportPlan(
+            group_by=["客户"],
+            aggregations=[
+                ExcelAggregation(column="金额", function="sum", header="总金额"),
+                ExcelAggregation(column="单号", function="count_distinct", header="订单数"),
+            ],
+            sort_by=[ExcelSort(column="总金额", direction="desc")],
+            columns=[
+                ExcelOutputColumn(source="客户", header="客户名称"),
+                ExcelOutputColumn(source="总金额"),
+                ExcelOutputColumn(source="订单数"),
+            ],
+        )
+
+        result = apply_excel_export_plan(rows, plan)
+
+        self.assertEqual(
+            result,
+            [
+                {"客户名称": "A", "总金额": 30, "订单数": 2},
+                {"客户名称": "B", "总金额": 5, "订单数": 1},
+            ],
+        )
+
     async def asyncSetUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory(dir=Path.cwd())
         self.root = Path(self.temp_dir.name)
@@ -174,6 +275,101 @@ class SessionScopedExportTests(unittest.IsolatedAsyncioTestCase):
             open_id="user-a",
             chat_id="chat-a",
             session_id="new-session",
+        )
+
+        self.assertIsNone(path)
+
+    async def test_reply_exports_the_referenced_result_instead_of_latest_result(self) -> None:
+        scope = {
+            "tenant_key": "tenant-a",
+            "app_id": "app-a",
+            "open_id": "user-a",
+            "chat_id": "chat-a",
+            "session_id": "session-a",
+        }
+        old_result_id = await save_tool_result(
+            request_id="request-old",
+            tenant_key=scope["tenant_key"],
+            app_id=scope["app_id"],
+            open_id=scope["open_id"],
+            bot_code="bot",
+            message_id="user-query-old",
+            chat_id=scope["chat_id"],
+            tool_name="sample_advice_notice",
+            tool_args={},
+            tool_result=json.dumps({"rows": [{"样品单号": "OLD"}]}, ensure_ascii=False),
+        )
+        await save_export_context(
+            **scope,
+            source_type="tool_result",
+            source_ref=str(old_result_id),
+            source_name="sample_advice_notice",
+            request_message_id="user-query-old",
+            reply_message_id="bot-reply-old",
+        )
+        new_result_id = await save_tool_result(
+            request_id="request-new",
+            tenant_key=scope["tenant_key"],
+            app_id=scope["app_id"],
+            open_id=scope["open_id"],
+            bot_code="bot",
+            message_id="user-query-new",
+            chat_id=scope["chat_id"],
+            tool_name="sample_advice_notice",
+            tool_args={},
+            tool_result=json.dumps({"rows": [{"样品单号": "NEW"}]}, ensure_ascii=False),
+        )
+        await save_export_context(
+            **scope,
+            source_type="tool_result",
+            source_ref=str(new_result_id),
+            source_name="sample_advice_notice",
+            request_message_id="user-query-new",
+            reply_message_id="bot-reply-new",
+        )
+
+        with patch("app.excel_export.EXPORT_DIR", self.root / "exports"):
+            path = await export_latest_result_to_excel(
+                **scope,
+                referenced_message_ids=["bot-reply-old"],
+            )
+
+        self.assertIsNotNone(path)
+        workbook = load_workbook(path, data_only=True)
+        self.assertEqual(workbook.active["A2"].value, "OLD")
+
+    async def test_unknown_reply_does_not_fall_back_to_latest_result(self) -> None:
+        scope = {
+            "tenant_key": "tenant-a",
+            "app_id": "app-a",
+            "open_id": "user-a",
+            "chat_id": "chat-a",
+            "session_id": "session-a",
+        }
+        result_id = await save_tool_result(
+            request_id="request-new",
+            tenant_key=scope["tenant_key"],
+            app_id=scope["app_id"],
+            open_id=scope["open_id"],
+            bot_code="bot",
+            message_id="user-query-new",
+            chat_id=scope["chat_id"],
+            tool_name="sample_advice_notice",
+            tool_args={},
+            tool_result=json.dumps({"rows": [{"样品单号": "NEW"}]}, ensure_ascii=False),
+        )
+        await save_export_context(
+            **scope,
+            source_type="tool_result",
+            source_ref=str(result_id),
+            source_name="sample_advice_notice",
+            request_message_id="user-query-new",
+            reply_message_id="bot-reply-new",
+        )
+
+        path = await export_latest_result_to_excel(
+            **scope,
+            referenced_message_ids=["unrelated-message"],
         )
 
         self.assertIsNone(path)

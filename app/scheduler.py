@@ -11,6 +11,7 @@ from app import scheduler_runtime
 from app.db import execute, fetch_all, fetch_one, open_db
 from app.feishu import TenantApp
 from app.memory.repository import fetch_recent_turns
+from app.schedule_planner import SchedulePlan, SchedulePlanError, plan_schedule_creation
 from app.settings import get_settings
 
 
@@ -206,6 +207,84 @@ def parse_schedule_command(text: str) -> dict[str, str] | None:
             "没有识别出任务编号或操作，请使用例如“删除#1定时任务”。"
         )
     return None
+
+
+async def resolve_schedule_command(
+    text: str,
+    *,
+    referenced_message_text: str | None = None,
+    referenced_request_text: str | None = None,
+) -> dict[str, str] | None:
+    command = parse_schedule_command(text)
+    if command and command.get("schedule_type") != "help":
+        return command
+
+    original_request = referenced_request_text or ""
+    if not original_request and referenced_message_text and is_schedule_creation_intent(
+        referenced_message_text
+    ):
+        original_request = referenced_message_text
+    should_plan = bool(
+        (command and command.get("schedule_type") == "help")
+        or (original_request and is_execution_mode_reply(text))
+    )
+    if not should_plan:
+        return command
+
+    try:
+        plan = await plan_schedule_creation(
+            text,
+            original_request=original_request or None,
+        )
+        return schedule_plan_to_command(plan)
+    except SchedulePlanError as exc:
+        return invalid_time_command(str(exc))
+
+
+def schedule_plan_to_command(plan: SchedulePlan) -> dict[str, str]:
+    if plan.action == "clarify":
+        return invalid_time_command(
+            (plan.clarification or "请补充执行时间和任务内容。").strip()
+        )
+    prompt = plan.prompt.strip()
+    if not prompt:
+        return invalid_time_command("缺少定时任务的执行内容。")
+    if not plan.schedule_type:
+        return invalid_time_command("缺少定时任务的执行时间。")
+
+    command: dict[str, str] = {
+        "schedule_type": plan.schedule_type,
+        "prompt": prompt,
+    }
+    if plan.execution_mode:
+        command["execution_mode"] = plan.execution_mode
+    if plan.task_name and plan.task_name.strip():
+        command["task_name"] = plan.task_name.strip()
+
+    try:
+        if plan.schedule_type == "daily":
+            if not plan.daily_time:
+                raise ValueError
+            command["daily_time"] = normalize_time(plan.daily_time.replace("：", ":"))
+        elif plan.schedule_type == "once":
+            if not plan.run_at:
+                raise ValueError
+            command["run_at"] = normalize_datetime(plan.run_at.replace("：", ":"))
+        else:
+            interval_minutes = int(plan.interval_minutes or 0)
+            if not MIN_INTERVAL_MINUTES <= interval_minutes <= MAX_INTERVAL_MINUTES:
+                return invalid_time_command(
+                    f"间隔时间必须在 {MIN_INTERVAL_MINUTES} 分钟到 7 天之间。"
+                )
+            command["interval_minutes"] = str(interval_minutes)
+    except (TypeError, ValueError):
+        return invalid_time_command("模型识别出的执行时间无效，请换一种时间表达重试。")
+    return command
+
+
+def is_execution_mode_reply(text: str) -> bool:
+    normalized = re.sub(r"[\s，,。.!！]+", "", (text or "")).casefold()
+    return normalized in {"agent", "agent模式", "提醒", "提醒模式"}
 
 
 def extract_outer_task_name(text: str) -> tuple[str | None, str]:
@@ -429,6 +508,42 @@ async def previous_business_query(event: dict[str, Any]) -> str | None:
             continue
         return content
     return None
+
+
+async def recent_schedule_creation_request(event: dict[str, Any]) -> str | None:
+    """Return only the immediately preceding schedule request awaiting follow-up."""
+    session_id = str(event.get("_session_id") or "")
+    if not session_id:
+        return None
+    turns = await fetch_recent_turns(
+        tenant_key=event["tenant_key"],
+        app_id=event["app_id"],
+        open_id=event["open_id"],
+        chat_id=event.get("chat_id"),
+        session_id=session_id,
+        limit=6,
+    )
+    latest_user_index = next(
+        (
+            index
+            for index in range(len(turns) - 1, -1, -1)
+            if turns[index].get("role") == "user"
+        ),
+        None,
+    )
+    if latest_user_index is None:
+        return None
+    request = str(turns[latest_user_index].get("content") or "").strip()
+    if not request or not is_schedule_creation_intent(request):
+        return None
+    later_answers = turns[latest_user_index + 1 :]
+    if any(
+        turn.get("role") == "assistant"
+        and "已创建定时任务" in str(turn.get("content") or "")
+        for turn in later_answers
+    ):
+        return None
+    return request
 
 
 def normalize_explicit_task_name(value: str) -> str:

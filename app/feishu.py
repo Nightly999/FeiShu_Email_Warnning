@@ -143,6 +143,9 @@ def normalize_event(
         "chat_id": message.get("chat_id") or event.get("chat_id"),
         "chat_type": message.get("chat_type") or event.get("chat_type"),
         "message_id": message.get("message_id"),
+        "root_id": message.get("root_id"),
+        "parent_id": message.get("parent_id"),
+        "thread_id": message.get("thread_id"),
         "message_type": message.get("message_type"),
         "text": extract_text(message),
         "file_key": extract_resource_key(message),
@@ -238,6 +241,22 @@ async def get_tenant_access_token(app: TenantApp) -> str:
         (cache_key, token, now + expire),
     )
     return token
+
+
+async def get_message(app: TenantApp, message_id: str) -> dict[str, Any] | None:
+    token = await get_tenant_access_token(app)
+    settings = get_settings()
+    async with httpx.AsyncClient(timeout=20) as client:
+        response = await client.get(
+            f"{settings.feishu_base_url}/open-apis/im/v1/messages/{message_id}",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        response.raise_for_status()
+        payload = response.json()
+    if payload.get("code") not in (None, 0):
+        raise ValueError(f"Feishu get message error: {payload}")
+    items = (payload.get("data") or {}).get("items") or []
+    return items[0] if items and isinstance(items[0], dict) else None
 
 
 async def reply_message(app: TenantApp, message_id: str, text: str) -> str | None:

@@ -73,6 +73,44 @@ async def fetch_recent_turns(
     return list(reversed(rows))
 
 
+async def fetch_conversation_turn_by_message_id(
+    *,
+    tenant_key: str,
+    app_id: str,
+    open_id: str,
+    chat_id: str | None,
+    session_id: str,
+    message_id: str,
+) -> dict[str, Any] | None:
+    async with open_db() as db:
+        cur = await db.execute(
+            """
+            SELECT role, content, metadata, created_at
+            FROM conversation_turn
+            WHERE tenant_key = ?
+              AND app_id = ?
+              AND open_id = ?
+              AND (chat_id = ? OR (chat_id IS NULL AND ? IS NULL))
+              AND session_id = ?
+              AND json_valid(metadata) = 1
+              AND json_extract(metadata, '$.message_id') = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (
+                tenant_key,
+                app_id,
+                open_id,
+                chat_id,
+                chat_id,
+                session_id,
+                message_id,
+            ),
+        )
+        row = await cur.fetchone()
+        return dict(row) if row else None
+
+
 async def add_long_memory(
     *,
     tenant_key: str,

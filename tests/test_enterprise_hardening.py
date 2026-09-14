@@ -22,6 +22,7 @@ from app.policy import check_agent_access, check_tool_access
 from app.settings import get_settings
 from app.feishu_cards import build_welcome_card
 from app.welcome import send_daily_welcome_once
+from app.feishu_ws import is_process_alive
 
 
 def tenant_app() -> TenantApp:
@@ -45,6 +46,10 @@ class SecurityBoundaryTests(unittest.TestCase):
         self.assertFalse(is_timestamp_fresh("1000", max_age_seconds=300, now=1400))
         self.assertFalse(is_timestamp_fresh("invalid", max_age_seconds=300, now=1200))
 
+    def test_process_probe_is_read_only_on_windows(self) -> None:
+        self.assertTrue(is_process_alive(os.getpid()))
+        self.assertFalse(is_process_alive(-1))
+
     def test_event_scope_cannot_override_configured_tenant(self) -> None:
         payload = {
             "header": {"tenant_key": "attacker-tenant", "app_id": "attacker-app"},
@@ -54,6 +59,28 @@ class SecurityBoundaryTests(unittest.TestCase):
         event = normalize_event(payload, tenant_app())
         self.assertEqual(event["tenant_key"], "trusted-tenant")
         self.assertEqual(event["app_id"], "trusted-app")
+
+    def test_reply_relationship_is_preserved_during_event_normalization(self) -> None:
+        payload = {
+            "header": {"tenant_key": "trusted-tenant", "app_id": "trusted-app"},
+            "event": {
+                "sender": {"sender_id": {"open_id": "ou_example"}},
+                "message": {
+                    "message_id": "message-current",
+                    "parent_id": "message-quoted",
+                    "root_id": "message-root",
+                    "thread_id": "thread-1",
+                    "message_type": "text",
+                    "content": '{"text":"继续处理"}',
+                },
+            },
+        }
+
+        event = normalize_event(payload, tenant_app())
+
+        self.assertEqual(event["parent_id"], "message-quoted")
+        self.assertEqual(event["root_id"], "message-root")
+        self.assertEqual(event["thread_id"], "thread-1")
 
     def test_authenticated_ws_event_can_supply_missing_tenant(self) -> None:
         app = tenant_app()

@@ -12,11 +12,33 @@ This project follows the same practical pattern used by OpenClaw-style Feishu ag
 Flow:
 
 1. MCP tool results are cached in `agent_tool_result_cache`.
-2. User sends `导出 Excel`.
-3. The latest cached rows for the current tenant, user, chat, and `/new` session are
-   written to `.xlsx`.
-4. The workbook is uploaded with Feishu IM file upload API.
-5. The bot replies with a file message.
+2. User requests an Excel file and may describe how it should be prepared, for example filtering,
+   deduplication, grouping, aggregation, sorting, column selection, or column renaming.
+3. The text model receives the real result schema and compact field samples, then calls the internal
+   `design_excel_export` tool with a declarative workbook plan. No field-specific export rule is
+   hardcoded.
+4. The latest cached rows for the current tenant, user, chat, and `/new` session are loaded in full.
+   A local executor validates all referenced columns and applies only allowlisted operations from the
+   plan before writing the styled `.xlsx` workbook.
+5. The workbook is uploaded with Feishu IM file upload API and the bot replies with a file message.
+
+### Quoted replies
+
+Feishu message events preserve `parent_id`, `root_id`, and `thread_id`. When a user replies to a
+specific bot card, the referenced card text is added to the Agent context with higher relevance than
+unrelated recent turns. Export contexts also store both the user's request message ID and the bot's
+reply message ID. Therefore a quoted `导出 Excel` request selects the tool result associated with the
+quoted card instead of whichever query happened most recently. Scope and session checks still apply,
+and an unmatched quote never falls back to unrelated data.
+
+## Agent scheduled tasks
+
+Known concise schedule commands continue to use the deterministic parser. Natural-language creation
+requests that do not match those forms are sent to the text model with the current Shanghai time.
+The model calls the internal `plan_scheduled_task` tool to select a validated schedule, execution
+mode, and task goal. At run time, `agent` tasks call the full Agent with a new isolated automation
+session, so it can select allowlisted MCP tools and fetch current business data instead of replaying a
+fixed answer. A mode-only reply to a quoted schedule help card can reuse the original creation request.
 
 Main files:
 

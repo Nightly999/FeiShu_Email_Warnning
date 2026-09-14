@@ -154,6 +154,8 @@ CREATE TABLE IF NOT EXISTS export_context (
   source_type TEXT NOT NULL,
   source_ref TEXT NOT NULL,
   source_name TEXT,
+  request_message_id TEXT,
+  reply_message_id TEXT,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -303,6 +305,7 @@ async def bootstrap() -> None:
         await ensure_memory_columns(db)
         await ensure_conversation_session_integrity(db)
         await ensure_uploaded_file_columns(db)
+        await ensure_export_context_columns(db)
         await ensure_scheduler_columns(db)
         if get_settings().app_env.lower() in {"dev", "local", "test"}:
             await db.executescript(SAMPLE_SQL)
@@ -370,6 +373,23 @@ async def ensure_uploaded_file_columns(db) -> None:
     columns = {row[1] for row in await cursor.fetchall()}
     if "session_id" not in columns:
         await db.execute("ALTER TABLE uploaded_file ADD COLUMN session_id TEXT")
+
+
+async def ensure_export_context_columns(db) -> None:
+    cursor = await db.execute("PRAGMA table_info(export_context)")
+    columns = {row[1] for row in await cursor.fetchall()}
+    for column in ("request_message_id", "reply_message_id"):
+        if column not in columns:
+            await db.execute(f"ALTER TABLE export_context ADD COLUMN {column} TEXT")
+    await db.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_export_context_message
+        ON export_context (
+          tenant_key, app_id, open_id, chat_id, session_id,
+          request_message_id, reply_message_id, id
+        )
+        """
+    )
 
 
 async def ensure_scheduler_columns(db) -> None:
