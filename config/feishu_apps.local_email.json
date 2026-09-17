@@ -1,0 +1,49 @@
+{
+  "apps": {
+    "asi-wip": {
+      "appId": "cli_aa2dd7ce3aba5bfb",
+      "appSecret": "dQRH3ysaSUTJm97ei9FcbbxacqPyBDiD",
+      "name": "来邮速递"
+    },
+    "asi-wip-weijie": {
+      "appId": "cli_aa2d19c2f8381bd6",
+      "appSecret": "KYPlg3BYCnqKtD5Py4wX7bGZNsTE41Fb",
+      "name": "上海维杰服饰-来邮速递"
+    },
+    "asi-wip-yuantong": {
+      "appId": "xxx",
+      "appSecret": "xxx",
+      "name": "淮安源通制帽-"
+    },
+    "asi-wip-weide": {
+      "appId": "xxx",
+      "appSecret": "xxx",
+      "name": "淮安伟德服饰-"
+    },
+    "asi-wip-yuanda": {
+      "appId": "xxx",
+      "appSecret": "xxx",
+      "name": "淮安远达服饰-"
+    },
+    "asi-wip-chuangshiji": {
+      "appId": "xxx",
+      "appSecret": "xxx",
+      "name": "淮安创世纪服饰-"
+    },
+    "asi-wip-fantai": {
+      "appId": "xxx",
+      "appSecret": "xxx",
+      "name": "上海泛太制帽-"
+    },
+    "asi-wip-yayuan": {
+      "appId": "xxx",
+      "appSecret": "xxx",
+      "name": "江苏亚源-"
+    },
+    "asi-wip-shanghaiyayuan": {
+      "appId": "xxx",
+      "appSecret": "xxx",
+      "name": "上海亚源-"
+    }
+  }
+}

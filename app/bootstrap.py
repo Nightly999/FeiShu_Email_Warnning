@@ -1,9 +1,13 @@
 import asyncio
 import json
+import logging
 from pathlib import Path
 
 from app.db import open_db
 from app.settings import get_settings
+
+
+logger = logging.getLogger("bootstrap")
 
 
 SCHEMA_SQL = """
@@ -269,6 +273,21 @@ CREATE TABLE IF NOT EXISTS welcome_delivery (
 
 CREATE INDEX IF NOT EXISTS idx_welcome_delivery_lookup
 ON welcome_delivery (tenant_key, app_id, chat_id, open_id, delivery_date);
+
+CREATE TABLE IF NOT EXISTS email_bind_token (
+  token_hash TEXT PRIMARY KEY,
+  tenant_key TEXT NOT NULL,
+  app_id TEXT NOT NULL,
+  bot_code TEXT,
+  open_id TEXT NOT NULL,
+  chat_id TEXT NOT NULL,
+  expires_at INTEGER NOT NULL,
+  used_at INTEGER,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_email_bind_token_expiry
+ON email_bind_token (expires_at, used_at);
 """
 
 
@@ -437,6 +456,11 @@ async def import_feishu_apps(db) -> None:
 
     payload = json.loads(config_path.read_text(encoding="utf-8"))
     apps = payload.get("apps", payload)
+    apps = {
+        bot_code: app_config
+        for bot_code, app_config in apps.items()
+        if _valid_feishu_app_config(bot_code, app_config)
+    }
     configured_codes = list(apps.keys())
     for bot_code, app_config in apps.items():
         tenant_key = app_config.get("tenantKey") or app_config.get("tenant_key") or ""
@@ -508,6 +532,22 @@ async def import_feishu_apps(db) -> None:
         )
     else:
         await db.execute("UPDATE feishu_tenant_app SET enabled = 0")
+
+
+def _valid_feishu_app_config(bot_code: str, app_config: object) -> bool:
+    if not isinstance(app_config, dict):
+        logger.warning("Skipping invalid Feishu app config: bot_code=%s", bot_code)
+        return False
+    app_id = str(app_config.get("appId") or "").strip()
+    app_secret = str(app_config.get("appSecret") or "").strip()
+    valid = app_id.startswith("cli_") and app_secret.lower() not in {
+        "",
+        "xxx",
+        "replace-me",
+    }
+    if not valid:
+        logger.warning("Skipping placeholder Feishu app config: bot_code=%s", bot_code)
+    return valid
 
 
 if __name__ == "__main__":

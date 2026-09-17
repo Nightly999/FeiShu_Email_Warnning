@@ -24,7 +24,9 @@ PREVIOUS_QUERY_PROMPT = "__previous_business_query__"
 
 
 def parse_schedule_command(text: str) -> dict[str, str] | None:
-    text = re.sub(r"[。！？!?]+$", "", (text or "").strip()).strip()
+    text = re.sub(
+        r"[。！？!?]+$", "", (text or "").strip().replace("：", ":")
+    ).strip()
     explicit_name, text = extract_outer_task_name(text)
     explicit_mode, text = extract_execution_mode(text)
     list_match = re.match(
@@ -50,6 +52,13 @@ def parse_schedule_command(text: str) -> dict[str, str] | None:
             "task_id": history.group(1),
             "page": history.group(2) or "1",
         }
+
+    if re.match(
+        r"^(?:取消|删除|删掉|移除|清空)\s*(?:我的\s*)?"
+        r"(?:(?:全部|所有)\s*)?定时任务$",
+        text,
+    ):
+        return {"schedule_type": "cancel_all"}
 
     management_patterns = (
         (
@@ -98,49 +107,28 @@ def parse_schedule_command(text: str) -> dict[str, str] | None:
             command["execution_mode"] = explicit_mode
         return command
 
-    daily = re.match(r"^每天\s*(\d{1,2}:\d{2})\s*(.+)$", text, re.S)
-    if daily:
-        try:
-            daily_time = normalize_time(daily.group(1))
-        except ValueError:
-            return invalid_time_command("时间无效，请使用 00:00 到 23:59，例如 09:00。")
-        prompt, inline_name = extract_inline_task_name(daily.group(2).strip())
-        command = {
-            "schedule_type": "daily",
-            "daily_time": daily_time,
-            "prompt": prompt,
-        }
-        task_name = explicit_name or inline_name
-        if task_name:
-            command["task_name"] = task_name
-        if explicit_mode:
-            command["execution_mode"] = explicit_mode
-        return command
-
-    natural_daily = re.match(
-        r"^每天\s*(早上|上午|中午|下午|晚上)?\s*(\d{1,2})\s*点"
-        r"\s*(?:(半)|(\d{1,2})\s*分?)?\s*(.+)$",
+    schedule_text = re.sub(
+        r"^(?:请\s*)?(?:帮我\s*)?(?:(?:设置|创建|新增)\s*)?"
+        r"定时(?:任务)?\s*[：:,，]?\s*",
+        "",
         text,
-        re.S,
     )
-    if natural_daily:
-        period = natural_daily.group(1) or ""
-        hour = int(natural_daily.group(2))
-        minute = 30 if natural_daily.group(3) else int(natural_daily.group(4) or 0)
-        if period in {"下午", "晚上"} and 1 <= hour < 12:
-            hour += 12
-        elif period in {"早上", "上午"} and hour == 12:
-            hour = 0
-        try:
-            daily_time = normalize_time(f"{hour}:{minute:02d}")
-        except ValueError:
-            return invalid_time_command("时间无效，例如可发送“每天早上9点提醒我”。")
-        prompt, inline_name = extract_inline_task_name(natural_daily.group(5).strip())
+
+    try:
+        daily_plan = parse_natural_daily_command(schedule_text)
+    except ValueError:
+        return invalid_time_command("时间无效，请使用 00:00 到 23:59，例如 09:30。")
+    if daily_plan:
+        times, raw_prompt = daily_plan
+        prompt, inline_name = extract_inline_task_name(raw_prompt)
         command = {
-            "schedule_type": "daily",
-            "daily_time": daily_time,
+            "schedule_type": "daily_multi" if len(times) > 1 else "daily",
             "prompt": prompt,
         }
+        if len(times) > 1:
+            command["daily_times"] = ",".join(times)
+        else:
+            command["daily_time"] = times[0]
         task_name = explicit_name or inline_name
         if task_name:
             command["task_name"] = task_name
@@ -209,6 +197,56 @@ def parse_schedule_command(text: str) -> dict[str, str] | None:
     return None
 
 
+def parse_natural_daily_command(text: str) -> tuple[list[str], str] | None:
+    match = re.match(r"^每天\s*", text)
+    if not match:
+        return None
+    position = match.end()
+    clock = re.compile(
+        r"(凌晨|清晨|早上|上午|中午|下午|晚上)?\s*"
+        r"([零〇一二两三四五六七八九十\d]{1,3})\s*"
+        r"(?::\s*([零〇一二两三四五六七八九十\d]{1,3})|"
+        r"点\s*(?:(半)|([零〇一二两三四五六七八九十\d]{1,3})\s*分?)?)"
+    )
+    times: list[str] = []
+    while True:
+        clock_match = clock.match(text, position)
+        if not clock_match:
+            return None
+        hour = parse_interval_number(clock_match.group(2))
+        minute = (
+            parse_interval_number(clock_match.group(3))
+            if clock_match.group(3)
+            else 30
+            if clock_match.group(4)
+            else parse_interval_number(clock_match.group(5) or "零")
+        )
+        if hour is None or minute is None:
+            raise ValueError("invalid clock")
+        period = clock_match.group(1) or ""
+        if period in {"下午", "晚上"} and 1 <= hour < 12:
+            hour += 12
+        elif period == "中午" and 1 <= hour < 11:
+            hour += 12
+        elif period in {"凌晨", "清晨"} and hour == 12:
+            hour = 0
+        elif period in {"早上", "上午"} and hour == 12:
+            hour = 0
+        times.append(normalize_time(f"{hour}:{minute:02d}"))
+        position = clock_match.end()
+        connector = re.match(r"\s*(?:和|、|,|，)\s*", text[position:])
+        if not connector:
+            break
+        next_position = position + connector.end()
+        if not clock.match(text, next_position):
+            break
+        position = next_position
+    prompt = text[position:].strip(" ，,。；;：:")
+    if not prompt:
+        return None
+    return list(dict.fromkeys(times)), prompt
+
+
 async def resolve_schedule_command(
     text: str,
     *,
@@ -216,7 +254,12 @@ async def resolve_schedule_command(
     referenced_request_text: str | None = None,
 ) -> dict[str, str] | None:
     command = parse_schedule_command(text)
-    if command and command.get("schedule_type") != "help":
+    management_types = {
+        "list", "history", "cancel_all", "cancel", "pause", "resume", "run_now", "invalid"
+    }
+    if command and command.get("schedule_type") in management_types:
+        if command.get("schedule_type") == "invalid" and looks_like_email_schedule(text):
+            command["help_text"] = email_schedule_help_text()
         return command
 
     original_request = referenced_request_text or ""
@@ -225,7 +268,8 @@ async def resolve_schedule_command(
     ):
         original_request = referenced_message_text
     should_plan = bool(
-        (command and command.get("schedule_type") == "help")
+        is_schedule_creation_intent(text)
+        or (command and command.get("schedule_type") == "help")
         or (original_request and is_execution_mode_reply(text))
     )
     if not should_plan:
@@ -238,7 +282,13 @@ async def resolve_schedule_command(
         )
         return schedule_plan_to_command(plan)
     except SchedulePlanError as exc:
-        return invalid_time_command(str(exc))
+        if command and command.get("schedule_type") != "help":
+            logger.warning("Schedule planning failed; using deterministic command: %s", exc)
+            return command
+        result = invalid_time_command(str(exc))
+        if looks_like_email_schedule(text):
+            result["help_text"] = email_schedule_help_text()
+        return result
 
 
 def schedule_plan_to_command(plan: SchedulePlan) -> dict[str, str]:
@@ -266,6 +316,13 @@ def schedule_plan_to_command(plan: SchedulePlan) -> dict[str, str]:
             if not plan.daily_time:
                 raise ValueError
             command["daily_time"] = normalize_time(plan.daily_time.replace("：", ":"))
+        elif plan.schedule_type == "daily_multi":
+            if not plan.daily_times:
+                raise ValueError
+            daily_times = [
+                normalize_time(value.replace("：", ":")) for value in plan.daily_times
+            ]
+            command["daily_times"] = ",".join(dict.fromkeys(daily_times))
         elif plan.schedule_type == "once":
             if not plan.run_at:
                 raise ValueError
@@ -380,7 +437,14 @@ def is_schedule_creation_intent(text: str) -> bool:
     creation_markers = ("创建", "新建", "设置", "新增", "创个", "建个", "怎么建", "怎么创建")
     return (
         "定时任务" in text and any(marker in text for marker in creation_markers)
-    ) or ("提醒" in text and any(marker in text for marker in creation_markers))
+    ) or ("提醒" in text and any(marker in text for marker in creation_markers)) or (
+        "每天" in text and any(marker in text for marker in ("推送", "提醒", "通知", "发送"))
+    )
+
+
+def looks_like_email_schedule(text: str) -> bool:
+    lowered = text.casefold()
+    return any(word in lowered for word in ("邮件", "邮箱", "收件箱", "email", "mail"))
 
 
 def is_schedule_management_intent(text: str) -> bool:
@@ -419,9 +483,11 @@ async def handle_schedule_command(app: TenantApp, event: dict[str, Any], command
     if command["schedule_type"] == "help":
         return schedule_help_text()
     if command["schedule_type"] == "invalid":
-        return command["error"] + "\n\n" + schedule_help_text()
+        return command["error"] + "\n\n" + command.get("help_text", schedule_help_text())
     if command["schedule_type"] == "list":
         return await list_scheduled_tasks(app, event, int(command.get("page") or 1))
+    if command["schedule_type"] == "cancel_all":
+        return await cancel_all_scheduled_tasks(app, event)
     if command["schedule_type"] in {"cancel", "pause", "resume", "run_now"}:
         return await manage_scheduled_task(
             app, event, int(command["task_id"]), command["schedule_type"]
@@ -433,6 +499,15 @@ async def handle_schedule_command(app: TenantApp, event: dict[str, Any], command
             int(command["task_id"]),
             int(command.get("page") or 1),
         )
+    if command["schedule_type"] == "daily_multi":
+        answers = []
+        for daily_time in command["daily_times"].split(","):
+            single = dict(command, schedule_type="daily", daily_time=daily_time)
+            single.pop("daily_times", None)
+            if command.get("task_name"):
+                single["task_name"] = f"{command['task_name']} {daily_time}"
+            answers.append(await create_scheduled_task(app, event, single))
+        return "\n\n".join(answers)
     return await create_scheduled_task(app, event, command)
 
 
@@ -454,6 +529,7 @@ def schedule_help_text() -> str:
         "- 恢复定时任务 #任务编号\n"
         "- 立即执行定时任务 #任务编号\n"
         "- 查看定时任务 #任务编号 运行记录\n"
+        "- 取消定时任务（取消当前用户的全部定时任务）\n"
         "- 取消定时任务 #任务编号"
     )
 
@@ -808,6 +884,43 @@ async def manage_scheduled_task(
     return (
         f"定时任务 #{task_id}“{task['task_name'] or '未命名任务'}”已加入执行队列。"
     )
+
+
+def email_schedule_help_text() -> str:
+    return (
+        "邮箱定时分析示例：\n"
+        "- 每天 08:20 分析未处理邮件并私聊推送\n"
+        "- 每天 08:20 和 17:20 分析最近 2 天的前 5 封邮件\n"
+        "- 每天晚上 9 点分析发件人为张三、主题包含报价的邮件\n\n"
+        "支持动态设置：时间范围、邮件数量、发件人、主题、关键词、"
+        "收件人、抄送、正文提及和重要程度。"
+    )
+
+
+async def cancel_all_scheduled_tasks(app: TenantApp, event: dict[str, Any]) -> str:
+    scope = (event["tenant_key"], app.app_id, event["chat_id"], event["open_id"])
+    row = await fetch_one(
+        """
+        SELECT COUNT(*) AS total
+        FROM scheduled_task
+        WHERE tenant_key = ? AND app_id = ? AND chat_id = ? AND open_id = ?
+          AND enabled = 1 AND (last_status IS NULL OR last_status != 'cancelled')
+        """,
+        scope,
+    )
+    total = int((row or {}).get("total") or 0)
+    if total == 0:
+        return "当前没有可取消的定时任务。"
+    await execute(
+        """
+        UPDATE scheduled_task
+        SET enabled = 0, locked_until = NULL, last_status = 'cancelled'
+        WHERE tenant_key = ? AND app_id = ? AND chat_id = ? AND open_id = ?
+          AND enabled = 1 AND (last_status IS NULL OR last_status != 'cancelled')
+        """,
+        scope,
+    )
+    return f"已取消当前用户的 {total} 个定时任务。"
 
 
 async def scheduled_task_history(

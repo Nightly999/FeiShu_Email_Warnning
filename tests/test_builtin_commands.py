@@ -36,6 +36,25 @@ class MemoryCommandIntentTests(unittest.TestCase):
 
 
 class BuiltinDeliveryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_custom_error_title_is_used(self) -> None:
+        with patch(
+            "app.builtin_commands.reply_card",
+            AsyncMock(return_value="message-new"),
+        ) as reply:
+            await deliver_builtin_answer(
+                tenant_app(),
+                message_id="message-original",
+                progress_message_id=None,
+                question="设置邮箱定时分析",
+                answer="请补充执行时间",
+                status="error",
+                title="邮箱定时设置失败",
+            )
+
+        card = reply.await_args.args[2]
+        self.assertEqual(card["header"]["template"], "red")
+        self.assertEqual(card["header"]["title"]["content"], "邮箱定时设置失败")
+
     async def test_failed_progress_update_replies_with_new_card(self) -> None:
         with (
             patch(

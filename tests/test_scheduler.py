@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 from unittest.mock import AsyncMock, patch
 
-from app.schedule_planner import SchedulePlan
+from app.schedule_planner import SchedulePlan, SchedulePlanError
 from app.scheduler import (
     PREVIOUS_QUERY_PROMPT,
     auto_task_name,
@@ -29,6 +29,39 @@ class ScheduleCommandTests(unittest.TestCase):
                 "schedule_type": "daily",
                 "daily_time": "09:05",
                 "prompt": "提醒我查看样品风险",
+            },
+        )
+
+    def test_multiple_daily_email_times_are_parsed(self) -> None:
+        command = parse_schedule_command("每天9:30和17:20推送当天重要邮件")
+        self.assertEqual(
+            command,
+            {
+                "schedule_type": "daily_multi",
+                "daily_times": "09:30,17:20",
+                "prompt": "推送当天重要邮件",
+            },
+        )
+
+    def test_prefixed_chinese_daily_email_times_are_parsed(self) -> None:
+        command = parse_schedule_command("定时每天十点和晚上九点推送，处理未读邮件")
+        self.assertEqual(
+            command,
+            {
+                "schedule_type": "daily_multi",
+                "daily_times": "10:00,21:00",
+                "prompt": "推送，处理未读邮件",
+            },
+        )
+
+    def test_fullwidth_mixed_period_email_times_are_parsed(self) -> None:
+        command = parse_schedule_command("定时每天8：20和晚上5：20推送，处理未读邮件")
+        self.assertEqual(
+            command,
+            {
+                "schedule_type": "daily_multi",
+                "daily_times": "08:20,17:20",
+                "prompt": "推送，处理未读邮件",
             },
         )
 
@@ -107,13 +140,20 @@ class ScheduleCommandTests(unittest.TestCase):
     def test_natural_daily_time_is_parsed(self) -> None:
         morning = parse_schedule_command("每天早上9点提醒我提交日报")
         afternoon = parse_schedule_command("每天下午3点半查询样品风险")
+        noon = parse_schedule_command("每天中午1点分析邮件")
+        midnight = parse_schedule_command("每天凌晨12点分析邮件")
         self.assertEqual(morning["daily_time"], "09:00")
         self.assertEqual(afternoon["daily_time"], "15:30")
+        self.assertEqual(noon["daily_time"], "13:00")
+        self.assertEqual(midnight["daily_time"], "00:00")
 
-    def test_unrecognized_management_expression_does_not_reach_model(self) -> None:
-        command = parse_schedule_command("删除定时任务")
-        self.assertEqual(command["schedule_type"], "invalid")
-        self.assertIn("任务编号", command["error"])
+    def test_cancel_without_id_cancels_all_current_user_tasks(self) -> None:
+        for text in ("取消定时任务", "删除定时任务", "取消全部定时任务"):
+            with self.subTest(text=text):
+                self.assertEqual(
+                    parse_schedule_command(text),
+                    {"schedule_type": "cancel_all"},
+                )
 
     def test_prompt_selects_reminder_or_agent_mode(self) -> None:
         self.assertEqual(execution_mode_for_prompt("提醒我提交日报"), "reminder")
@@ -211,6 +251,69 @@ class AgentSchedulePlanningTests(unittest.IsolatedAsyncioTestCase):
             },
         )
         planner.assert_awaited_once()
+
+    async def test_model_plan_supports_multiple_daily_times(self) -> None:
+        plan = SchedulePlan(
+            action="create",
+            schedule_type="daily_multi",
+            daily_times=["10:00", "21:00"],
+            prompt="分析并推送未读邮件",
+            execution_mode="agent",
+        )
+        with patch(
+            "app.scheduler.plan_schedule_creation",
+            AsyncMock(return_value=plan),
+        ):
+            command = await resolve_schedule_command(
+                "请设置一个每天上午十点和晚上九点发送未读邮件分析的任务"
+            )
+
+        self.assertEqual(command["schedule_type"], "daily_multi")
+        self.assertEqual(command["daily_times"], "10:00,21:00")
+        self.assertEqual(command["execution_mode"], "agent")
+
+    async def test_model_is_preferred_for_parseable_schedule_creation(self) -> None:
+        plan = SchedulePlan(
+            action="create",
+            schedule_type="daily_multi",
+            daily_times=["10:00", "21:00"],
+            prompt="分析最近三天的前五封未处理邮件",
+            execution_mode="agent",
+        )
+        with patch(
+            "app.scheduler.plan_schedule_creation",
+            AsyncMock(return_value=plan),
+        ) as planner:
+            command = await resolve_schedule_command(
+                "定时每天十点和晚上九点推送，分析最近三天的前五封未处理邮件"
+            )
+
+        planner.assert_awaited_once()
+        self.assertEqual(command["daily_times"], "10:00,21:00")
+        self.assertEqual(command["prompt"], "分析最近三天的前五封未处理邮件")
+
+    async def test_email_schedule_uses_parser_when_model_is_temporarily_unavailable(self) -> None:
+        with patch(
+            "app.scheduler.plan_schedule_creation",
+            AsyncMock(side_effect=SchedulePlanError("模型暂时不可用")),
+        ):
+            command = await resolve_schedule_command(
+                "定时每天8：20和晚上5：20推送，处理未读邮件"
+            )
+
+        self.assertEqual(command["schedule_type"], "daily_multi")
+        self.assertEqual(command["daily_times"], "08:20,17:20")
+
+    async def test_email_schedule_failure_uses_email_specific_help(self) -> None:
+        with patch(
+            "app.scheduler.plan_schedule_creation",
+            AsyncMock(side_effect=SchedulePlanError("模型暂时不可用")),
+        ):
+            command = await resolve_schedule_command("设置定时任务，分析邮件")
+
+        self.assertEqual(command["schedule_type"], "invalid")
+        self.assertIn("邮箱定时分析示例", command["help_text"])
+        self.assertNotIn("生产进度", command["help_text"])
 
     async def test_mode_reply_completes_quoted_creation_request(self) -> None:
         plan = SchedulePlan(

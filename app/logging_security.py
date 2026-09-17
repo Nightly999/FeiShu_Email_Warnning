@@ -5,16 +5,18 @@ import re
 
 
 _QUERY_SECRET = re.compile(
-    r"(?i)(access_key|ticket|token|app_secret|appSecret)=([^&\s]+)"
+    r"(?i)(access_key|ticket|token|app_secret|appSecret|password|email_password|credential|pwd)=([^;&\s]+)"
 )
 _JSON_SECRET = re.compile(
-    r'(?i)(["\'](?:access_key|ticket|token|app_secret|appSecret)["\']\s*:\s*["\'])([^"\']+)'
+    r'(?i)(["\'](?:access_key|ticket|token|app_secret|appSecret|password|email_password|credential|pwd)["\']\s*:\s*["\'])([^"\']+)'
 )
+_ODBC_SECRET = re.compile(r"(?i)(PWD=)(\{.*?\}(?=;|$)|[^;\s]*)")
 _OPEN_ID = re.compile(r"\bou_[A-Za-z0-9_-]+\b")
 
 
 def redact_sensitive_text(value: object) -> str:
     text = str(value)
+    text = _ODBC_SECRET.sub(r"\1***", text)
     text = _QUERY_SECRET.sub(r"\1=***", text)
     text = _JSON_SECRET.sub(r"\1***", text)
     return _OPEN_ID.sub(_mask_open_id, text)

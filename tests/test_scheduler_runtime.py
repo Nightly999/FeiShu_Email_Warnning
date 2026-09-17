@@ -9,9 +9,11 @@ from unittest.mock import AsyncMock, patch
 from app.answers import AnswerResult
 from app.bootstrap import bootstrap
 from app.db import execute, fetch_one
+from app.email_service import EmailCommandResult
 from app.feishu import TenantApp
 from app.scheduler import (
     PREVIOUS_QUERY_PROMPT,
+    cancel_all_scheduled_tasks,
     create_scheduled_task,
     list_scheduled_tasks,
     manage_scheduled_task,
@@ -130,6 +132,35 @@ class SchedulerRuntimeTests(unittest.IsolatedAsyncioTestCase):
             (task["id"],),
         )
         self.assertEqual(queued, {"enabled": 1, "last_status": "queued"})
+
+    async def test_cancel_all_only_affects_current_user_scope(self) -> None:
+        own_first = await self.insert_due_task(execution_mode="agent")
+        own_second = await self.insert_due_task(execution_mode="agent")
+        await execute(
+            "UPDATE scheduled_task SET open_id = 'other-user' WHERE id = ?",
+            (own_second,),
+        )
+        event = {
+            "tenant_key": "tenant",
+            "app_id": "app",
+            "open_id": "user",
+            "chat_id": "chat",
+            "chat_type": "p2p",
+        }
+
+        answer = await cancel_all_scheduled_tasks(tenant_app(), event)
+
+        own = await fetch_one(
+            "SELECT enabled, last_status FROM scheduled_task WHERE id = ?",
+            (own_first,),
+        )
+        other = await fetch_one(
+            "SELECT enabled, last_status FROM scheduled_task WHERE id = ?",
+            (own_second,),
+        )
+        self.assertEqual(answer, "已取消当前用户的 1 个定时任务。")
+        self.assertEqual(own, {"enabled": 0, "last_status": "cancelled"})
+        self.assertEqual(other, {"enabled": 1, "last_status": "idle"})
 
     async def test_generated_names_are_unique_and_explicit_duplicates_are_rejected(self) -> None:
         event = {
@@ -299,6 +330,29 @@ class SchedulerRuntimeTests(unittest.IsolatedAsyncioTestCase):
             delivery.await_args.kwargs["content"]["text"],
             "定时提醒：提醒我提交日报",
         )
+
+    async def test_scheduled_email_delivers_email_briefing_card(self) -> None:
+        await self.insert_due_task(
+            execution_mode="agent",
+            prompt="分析最近三天的前五封未处理邮件",
+        )
+        email_card = {
+            "schema": "2.0",
+            "header": {"title": {"content": "📬 AI 邮件智能简报"}},
+            "body": {"elements": []},
+        }
+        delivery = AsyncMock(return_value="message-id")
+
+        with (
+            patch(
+                "app.email_service.handle_email_command",
+                AsyncMock(return_value=EmailCommandResult("邮件分析", card=email_card)),
+            ),
+            patch("app.scheduler_runtime.send_card", delivery),
+        ):
+            await run_due_tasks({"app": tenant_app()})
+
+        self.assertIs(delivery.await_args.args[2], email_card)
 
     async def test_interval_agent_remains_enabled_after_success(self) -> None:
         task_id = await self.insert_due_task(

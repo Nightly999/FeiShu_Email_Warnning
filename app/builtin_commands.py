@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from app.business_pagination import parse_business_page_command, render_business_page
+from app.email_repository import finalize_push_logs
+from app.email_service import handle_email_command
 from app.excel_design import ExcelDesignError
 from app.excel_export import export_latest_result_to_excel
 from app.feishu import (
@@ -27,6 +30,9 @@ from app.scheduler import (
 )
 
 
+logger = logging.getLogger("builtin_commands")
+
+
 async def deliver_builtin_answer(
     app: TenantApp,
     *,
@@ -34,8 +40,10 @@ async def deliver_builtin_answer(
     progress_message_id: str | None,
     question: str,
     answer: str,
+    status: str = "success",
+    title: str | None = None,
 ) -> None:
-    card = build_answer_card(question, answer)
+    card = build_answer_card(question, answer, status=status, title=title)
     if progress_message_id:
         if await update_card(app, progress_message_id, card):
             return
@@ -171,7 +179,50 @@ async def handle_builtin_text_command(
             progress_message_id=progress_message_id,
             question=text,
             answer=answer,
+            status="error" if command.get("schedule_type") == "invalid" else "success",
+            title=(
+                "邮箱定时设置失败"
+                if command.get("schedule_type") == "invalid"
+                and any(word in text.casefold() for word in ("邮件", "邮箱", "email", "mail"))
+                else "定时任务"
+            ),
         )
+        return True
+
+    email_result = await handle_email_command(event)
+    if email_result:
+        try:
+            if email_result.card:
+                if progress_message_id and await update_card(
+                    app, progress_message_id, email_result.card
+                ):
+                    pass
+                else:
+                    await reply_card(app, message_id, email_result.card)
+            else:
+                await deliver_builtin_answer(
+                    app,
+                    message_id=message_id,
+                    progress_message_id=progress_message_id,
+                    question=text,
+                    answer=email_result.answer,
+                    status=email_result.status,
+                )
+            if email_result.run_ref:
+                try:
+                    await finalize_push_logs(email_result.run_ref, True)
+                except Exception:
+                    logger.exception("Failed to finalize manual email push log")
+        except Exception as exc:
+            if email_result.run_ref:
+                try:
+                    await finalize_push_logs(
+                        email_result.run_ref, False, type(exc).__name__
+                    )
+                except Exception:
+                    logger.exception("Failed to record manual email delivery failure")
+            raise
+        await record_agent_exchange(event, email_result.answer)
         return True
 
     file_answer = await answer_from_recent_file(event, text)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -28,9 +29,15 @@ class PermanentTaskError(RuntimeError):
 async def run_scheduler(apps: list[TenantApp]) -> None:
     app_by_id = {app.app_id: app for app in apps}
     settings = get_settings()
+    last_email_cleanup = 0.0
     while True:
         try:
             await run_due_tasks(app_by_id)
+            if settings.email_feature_enabled and time.monotonic() - last_email_cleanup >= 3600:
+                from app.email_repository import cleanup_expired_email_data
+
+                last_email_cleanup = time.monotonic()
+                await cleanup_expired_email_data()
         except Exception:
             logger.exception("Scheduled task polling failed")
         await asyncio.sleep(max(1, settings.scheduler_poll_seconds))
@@ -66,24 +73,28 @@ async def execute_claimed_task(app: TenantApp, task: dict[str, Any]) -> None:
             timeout=max(1, int(task.get("timeout_seconds") or 120)),
         )
         await deliver_task_result(app, task, output)
+        await finalize_email_delivery(task, run_id, success=True)
     except PermanentTaskError as exc:
+        await finalize_email_delivery(task, run_id, success=False, error=type(exc).__name__)
         logger.warning("Scheduled task permanently denied: task_id=%s", task["id"])
         await handle_task_failure(task, run_id, str(exc), permanent=True, app=app)
     except TimeoutError:
+        await finalize_email_delivery(task, run_id, success=False, error="TimeoutError")
         error = f"执行超过 {task.get('timeout_seconds') or 120} 秒，已超时"
         logger.warning("Scheduled task timed out: task_id=%s", task["id"])
         await handle_task_failure(task, run_id, error, app=app)
     except Exception as exc:  # noqa: BLE001
+        await finalize_email_delivery(task, run_id, success=False, error=type(exc).__name__)
         logger.exception("Scheduled task failed: task_id=%s", task["id"])
         await handle_task_failure(task, run_id, str(exc), app=app)
     else:
-        await complete_task_run(run_id, output)
+        await complete_task_run(run_id, _output_text(output))
         await mark_task_success(task, run_id)
 
 
 async def execute_task_payload(
     task: dict[str, Any], app: TenantApp, run_id: str
-) -> str:
+) -> Any:
     if task.get("execution_mode") != "agent":
         return f"定时提醒：{task['prompt']}"
 
@@ -98,7 +109,17 @@ async def execute_task_payload(
         "chat_type": task.get("chat_type") or "group",
         "_session_id": f"automation:{task['id']}:{run_id}",
         "_automation_run": True,
+        "_email_task_id": task["id"],
     }
+    from app.email_service import handle_email_command
+
+    email_result = await handle_email_command(event)
+    if email_result:
+        if email_result.status == "denied":
+            raise PermanentTaskError(email_result.answer)
+        if email_result.status == "error":
+            raise RuntimeError(email_result.answer)
+        return email_result
     result = await run_agent(event)
     if result.status == "denied":
         raise PermanentTaskError(result.content)
@@ -107,14 +128,32 @@ async def execute_task_payload(
     return result.content
 
 
+async def finalize_email_delivery(
+    task: dict[str, Any], run_id: str, *, success: bool, error: str | None = None
+) -> None:
+    from app.email_repository import finalize_push_logs
+    from app.email_service import looks_like_email_request
+
+    if get_settings().email_feature_enabled and looks_like_email_request(task.get("prompt") or ""):
+        try:
+            await finalize_push_logs(
+                f"scheduled:{task['id']}:{run_id}", success, error
+            )
+        except Exception:
+            logger.exception("Failed to finalize scheduled email push log: task_id=%s", task["id"])
+
+
 async def deliver_task_result(
-    app: TenantApp, task: dict[str, Any], output: str
+    app: TenantApp, task: dict[str, Any], output: Any
 ) -> None:
     if task.get("execution_mode") == "agent":
+        if getattr(output, "card", None):
+            await send_card(app, task["chat_id"], output.card)
+            return
         task_label = f"#{task['id']} {task.get('task_name') or '未命名任务'}"
         card = build_answer_card(
             f"{task_label}｜{task['prompt']}",
-            output[:MAX_DELIVERY_CHARS],
+            _output_text(output)[:MAX_DELIVERY_CHARS],
             title="定时任务执行结果",
             footer_label="任务",
         )
@@ -124,8 +163,12 @@ async def deliver_task_result(
         app,
         task["chat_id"],
         msg_type="text",
-        content={"text": output[:MAX_DELIVERY_CHARS]},
+        content={"text": _output_text(output)[:MAX_DELIVERY_CHARS]},
     )
+
+
+def _output_text(output: Any) -> str:
+    return str(getattr(output, "answer", output))
 
 
 async def claim_due_tasks(now: str) -> list[dict[str, Any]]:

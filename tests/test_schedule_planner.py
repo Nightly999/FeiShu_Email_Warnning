@@ -7,6 +7,52 @@ from app.schedule_planner import extract_schedule_plan_arguments, plan_schedule_
 
 
 class SchedulePlannerToolTests(unittest.IsolatedAsyncioTestCase):
+    def test_text_encoded_multi_times_are_decoded(self) -> None:
+        response = type(
+            "Response",
+            (),
+            {
+                "tool_calls": [],
+                "content": """<tool_call>
+<function=plan_scheduled_task>
+<parameter=action>create</parameter>
+<parameter=schedule_type>daily_multi</parameter>
+<parameter=daily_times>["10:00", "21:00"]</parameter>
+<parameter=prompt>分析未处理邮件</parameter>
+<parameter=execution_mode>agent</parameter>
+</function>
+</tool_call>""",
+            },
+        )()
+
+        arguments = extract_schedule_plan_arguments(response)
+
+        self.assertEqual(arguments["daily_times"], ["10:00", "21:00"])
+
+    def test_tool_call_multi_times_string_is_decoded(self) -> None:
+        response = type(
+            "Response",
+            (),
+            {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "name": "plan_scheduled_task",
+                        "args": {
+                            "action": "create",
+                            "schedule_type": "daily_multi",
+                            "daily_times": '["10:00", "21:00"]',
+                            "prompt": "分析未处理邮件",
+                        },
+                    }
+                ],
+            },
+        )()
+
+        arguments = extract_schedule_plan_arguments(response)
+
+        self.assertEqual(arguments["daily_times"], ["10:00", "21:00"])
+
     def test_mimo_text_encoded_tool_call_is_supported(self) -> None:
         response = type(
             "Response",

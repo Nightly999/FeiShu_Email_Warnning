@@ -30,6 +30,7 @@ SCHEDULE_PLAN_FIELDS = {
     "schedule_type",
     "run_at",
     "daily_time",
+    "daily_times",
     "interval_minutes",
     "prompt",
     "execution_mode",
@@ -46,9 +47,10 @@ class SchedulePlan(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     action: Literal["create", "clarify"]
-    schedule_type: Literal["once", "daily", "interval"] | None = None
+    schedule_type: Literal["once", "daily", "daily_multi", "interval"] | None = None
     run_at: str | None = None
     daily_time: str | None = None
+    daily_times: list[str] | None = None
     interval_minutes: int | None = None
     prompt: str = ""
     execution_mode: Literal["agent", "reminder"] | None = None
@@ -67,10 +69,14 @@ SCHEDULE_TOOL = {
                 "action": {"type": "string", "enum": ["create", "clarify"]},
                 "schedule_type": {
                     "type": ["string", "null"],
-                    "enum": ["once", "daily", "interval", None],
+                    "enum": ["once", "daily", "daily_multi", "interval", None],
                 },
                 "run_at": {"type": ["string", "null"]},
                 "daily_time": {"type": ["string", "null"]},
+                "daily_times": {
+                    "type": ["array", "null"],
+                    "items": {"type": "string"},
+                },
                 "interval_minutes": {"type": ["integer", "null"]},
                 "prompt": {"type": "string"},
                 "execution_mode": {
@@ -85,6 +91,7 @@ SCHEDULE_TOOL = {
                 "schedule_type",
                 "run_at",
                 "daily_time",
+                "daily_times",
                 "interval_minutes",
                 "prompt",
                 "execution_mode",
@@ -102,7 +109,7 @@ SCHEDULE_PLANNER_PROMPT = """
 
 规则：
 1. 从用户原始请求中提取执行时间和任务目标，不要生成代码、SQL 或 MCP 工具名。
-2. daily 使用 24 小时制 HH:MM；once 使用 YYYY-MM-DD HH:MM；interval 使用整数分钟。
+2. daily 使用 24 小时制 HH:MM；一天多个时间使用 daily_multi，并把所有 HH:MM 放入 daily_times；once 使用 YYYY-MM-DD HH:MM；interval 使用整数分钟。
 3. 需要届时查询、分析或汇总业务系统真实数据的任务使用 agent。只发送固定提醒文字的任务使用 reminder。
 4. “查询预计日期前三天仍未完成并通知我”属于 agent，而“提醒我提交日报”属于 reminder。
 5. prompt 保存届时交给 Agent 或提醒器的完整目标，删除“创建定时任务”“开始执行内容是”等外层措辞。
@@ -157,7 +164,7 @@ def extract_schedule_plan_arguments(response: Any) -> dict[str, Any]:
             except json.JSONDecodeError as exc:
                 raise SchedulePlanError("模型返回了无法解析的定时任务计划") from exc
         if isinstance(arguments, dict):
-            return arguments
+            return _normalize_schedule_arguments(arguments)
     content = getattr(response, "content", "")
     if isinstance(content, str):
         match = TEXT_TOOL_CALL_PATTERN.search(content)
@@ -167,9 +174,28 @@ def extract_schedule_plan_arguments(response: Any) -> dict[str, Any]:
                 if name not in SCHEDULE_PLAN_FIELDS:
                     continue
                 value = unescape(raw_value.strip())
-                arguments[name] = (
-                    None if value.casefold() in {"", "null", "none", "nil"} else value
-                )
+                if value.casefold() in {"", "null", "none", "nil"}:
+                    arguments[name] = None
+                elif name == "daily_times":
+                    try:
+                        arguments[name] = json.loads(value)
+                    except json.JSONDecodeError:
+                        arguments[name] = [
+                            item.strip() for item in value.split(",") if item.strip()
+                        ]
+                else:
+                    arguments[name] = value
             if arguments:
-                return arguments
+                return _normalize_schedule_arguments(arguments)
     raise SchedulePlanError("模型没有调用定时任务规划工具，请重试")
+
+
+def _normalize_schedule_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
+    daily_times = arguments.get("daily_times")
+    if not isinstance(daily_times, str):
+        return arguments
+    try:
+        parsed = json.loads(daily_times)
+    except json.JSONDecodeError:
+        parsed = [item.strip() for item in daily_times.split(",") if item.strip()]
+    return {**arguments, "daily_times": parsed}

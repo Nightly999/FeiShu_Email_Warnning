@@ -1,4 +1,6 @@
 import asyncio
+import base64
+import http
 import json
 import logging
 import multiprocessing
@@ -18,10 +20,33 @@ from lark_oapi.api.im.v1 import (
     P2ImChatAccessEventBotP2pChatEnteredV1,
     P2ImMessageReceiveV1,
 )
+from lark_oapi.core.const import UTF_8
+from lark_oapi.core.json import JSON
+from lark_oapi.event.callback.model.p2_card_action_trigger import (
+    P2CardActionTrigger,
+    P2CardActionTriggerResponse,
+)
+from lark_oapi.ws.client import _get_by_key
+from lark_oapi.ws.const import (
+    HEADER_BIZ_RT,
+    HEADER_MESSAGE_ID,
+    HEADER_SEQ,
+    HEADER_SUM,
+    HEADER_TYPE,
+)
+from lark_oapi.ws.enum import MessageType
+from lark_oapi.ws.model import Response
 
 from app.bootstrap import bootstrap
 from app.builtin_commands import handle_builtin_text_command
 from app.event_dedup import claim_event, finish_event
+from app.email_pop3 import EmailAuthenticationError, EmailConnectionError
+from app.email_service import (
+    bind_email_account,
+    consume_bind_token,
+    get_bind_scope,
+    initial_sync,
+)
 from app.feishu import (
     TenantApp,
     download_message_file,
@@ -30,6 +55,7 @@ from app.feishu import (
     normalize_event,
     reply_card,
     reply_message,
+    send_card,
     update_card,
 )
 from app.feishu_cards import build_answer_card, build_processing_card, should_use_card
@@ -78,6 +104,49 @@ class ConversationSequencer:
                     self._serving.pop(key, None)
                     self._issued.pop(key, None)
                 self._condition.notify_all()
+
+
+class CardCallbackWsClient(lark.ws.Client):
+    """Dispatch CARD frames until lark-oapi fixes its WebSocket client."""
+
+    # ponytail: remove this override when upstream dispatches MessageType.CARD.
+    async def _handle_data_frame(self, frame) -> None:
+        message_type = MessageType(_get_by_key(frame.headers, HEADER_TYPE))
+        if message_type != MessageType.CARD:
+            await super()._handle_data_frame(frame)
+            return
+
+        payload = frame.payload
+        total = int(_get_by_key(frame.headers, HEADER_SUM))
+        if total > 1:
+            message_id = next(
+                header.value
+                for header in frame.headers
+                if header.key == HEADER_MESSAGE_ID
+            )
+            payload = self._combine(
+                message_id,
+                total,
+                int(_get_by_key(frame.headers, HEADER_SEQ)),
+                payload,
+            )
+            if payload is None:
+                return
+
+        response = Response(code=http.HTTPStatus.OK)
+        started_at = int(round(time.time() * 1000))
+        try:
+            result = self._event_handler._do_without_validation(payload)
+            if result is not None:
+                response.data = base64.b64encode(JSON.marshal(result).encode(UTF_8))
+        except Exception:
+            logger.exception("Failed to handle Feishu card callback")
+            response = Response(code=http.HTTPStatus.INTERNAL_SERVER_ERROR)
+        header = frame.headers.add()
+        header.key = HEADER_BIZ_RT
+        header.value = str(int(round(time.time() * 1000)) - started_at)
+        frame.payload = JSON.marshal(response).encode(UTF_8)
+        await self._write_message(frame.SerializeToString())
 
 
 def main() -> None:
@@ -320,6 +389,37 @@ def run_client_process(app_payload: dict[str, Any]) -> None:
         except Exception:
             logger.exception("Failed to handle bot chat entered event: bot_code=%s", app.bot_code)
 
+    def handle_card_action(data: P2CardActionTrigger) -> P2CardActionTriggerResponse:
+        try:
+            payload = json.loads(lark.JSON.marshal(data))
+            action = extract_email_bind_card_action(payload, app)
+            if not action:
+                return P2CardActionTriggerResponse(
+                    {"toast": {"type": "warning", "content": "无法识别该卡片操作。"}}
+                )
+            if not event_slots.acquire(blocking=False):
+                return P2CardActionTriggerResponse(
+                    {"toast": {"type": "error", "content": "当前请求较多，请稍后重试。"}}
+                )
+            try:
+                future = event_executor.submit(
+                    process_email_bind_card_thread,
+                    app_payload,
+                    action,
+                )
+                future.add_done_callback(release_event_slot)
+            except Exception:
+                event_slots.release()
+                raise
+            return P2CardActionTriggerResponse(
+                {"toast": {"type": "info", "content": "正在验证邮箱账号，请稍候…"}}
+            )
+        except Exception:
+            logger.exception("Failed to enqueue card callback: bot_code=%s", app.bot_code)
+            return P2CardActionTriggerResponse(
+                {"toast": {"type": "error", "content": "邮箱绑定请求处理失败，请重试。"}}
+            )
+
     event_handler = (
         lark.EventDispatcherHandler.builder(
             app.encrypt_key or "",
@@ -327,9 +427,10 @@ def run_client_process(app_payload: dict[str, Any]) -> None:
         )
         .register_p2_im_message_receive_v1(handle_message)
         .register_p2_im_chat_access_event_bot_p2p_chat_entered_v1(handle_bot_p2p_entered)
+        .register_p2_card_action_trigger(handle_card_action)
         .build()
     )
-    client = lark.ws.Client(
+    client = CardCallbackWsClient(
         app_id=app.app_id,
         app_secret=app.app_secret,
         event_handler=event_handler,
@@ -338,6 +439,97 @@ def run_client_process(app_payload: dict[str, Any]) -> None:
     )
     logger.info("Starting Feishu websocket: bot_code=%s app_id=%s", app.bot_code, app.app_id)
     client.start()
+
+
+def extract_email_bind_card_action(
+    payload: dict[str, Any], app: TenantApp
+) -> dict[str, str] | None:
+    event = payload.get("event") or {}
+    operator = event.get("operator") or {}
+    action = event.get("action") or {}
+    value = action.get("value") or {}
+    form = action.get("form_value") or {}
+    context = event.get("context") or {}
+    if value.get("action") != "email_bind" or action.get("tag") != "button":
+        return None
+    tenant_key = str(operator.get("tenant_key") or app.tenant_key or "")
+    if app.tenant_key and tenant_key != app.tenant_key:
+        return None
+    result = {
+        "tenant_key": tenant_key,
+        "app_id": app.app_id,
+        "bot_code": app.bot_code,
+        "open_id": str(operator.get("open_id") or ""),
+        "chat_id": str(context.get("open_chat_id") or ""),
+        "message_id": str(context.get("open_message_id") or ""),
+        "token": str(value.get("token") or ""),
+        "email": str(form.get("email_account") or ""),
+        "password": str(form.get("email_password") or ""),
+    }
+    if not all(result.values()):
+        return None
+    return result
+
+
+def process_email_bind_card_thread(
+    app_payload: dict[str, Any], action: dict[str, str]
+) -> None:
+    try:
+        asyncio.run(process_email_bind_card(TenantApp(**app_payload), action))
+    except Exception:
+        logger.exception("Failed to process email bind card")
+
+
+async def process_email_bind_card(app: TenantApp, action: dict[str, str]) -> None:
+    scope = await get_bind_scope(action["token"])
+    if not scope or any(
+        str(scope[key] or "") != action[key]
+        for key in ("tenant_key", "app_id", "open_id", "chat_id")
+    ):
+        await send_card(
+            app,
+            action["chat_id"],
+            build_answer_card("邮箱绑定", "绑定卡片已失效，请重新发起绑定。", status="error"),
+        )
+        return
+
+    event = {
+        "tenant_key": scope["tenant_key"],
+        "app_id": scope["app_id"],
+        "bot_code": scope.get("bot_code") or app.bot_code,
+        "open_id": scope["open_id"],
+        "chat_id": scope["chat_id"],
+    }
+    try:
+        account = await bind_email_account(event, action["email"], action["password"])
+    except EmailAuthenticationError:
+        message = "邮箱账号或密码错误，请检查后重试。"
+    except EmailConnectionError:
+        message = "暂时无法连接邮箱服务器，请稍后重试。"
+    except ValueError as exc:
+        message = str(exc)
+    except Exception:
+        logger.exception("Email account binding failed")
+        message = "邮箱绑定暂时无法保存，请联系信息管理中心。"
+    else:
+        await consume_bind_token(action["token"])
+        try:
+            count = await initial_sync(account)
+        except Exception:
+            logger.exception("Initial email synchronization failed")
+            message = "邮箱绑定成功，但首次同步失败；请稍后发送“分析我的邮件”重试。"
+        else:
+            message = f"邮箱绑定成功，首次同步新增 {count} 封邮件。"
+        card = build_answer_card("邮箱绑定", message)
+        if not await update_card(app, action["message_id"], card):
+            await send_card(app, scope["chat_id"], card)
+        return
+
+    await send_card(
+        app,
+        scope["chat_id"],
+        build_answer_card("邮箱绑定", message, status="error"),
+    )
 
 
 def conversation_key(payload: dict[str, Any], app: TenantApp) -> ConversationKey:

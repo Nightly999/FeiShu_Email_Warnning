@@ -22,7 +22,7 @@ class FeishuAppImportTests(unittest.IsolatedAsyncioTestCase):
                         "apps": {
                             "new-code": {
                                 "tenantKey": "tenant",
-                                "appId": "app",
+                                "appId": "cli_app",
                                 "appSecret": "new-secret",
                                 "name": "Renamed bot",
                             }
@@ -53,7 +53,7 @@ class FeishuAppImportTests(unittest.IsolatedAsyncioTestCase):
                     """
                     INSERT INTO feishu_tenant_app (
                       tenant_key, app_id, app_secret, bot_code, bot_name
-                    ) VALUES ('tenant', 'app', 'old-secret', 'old-code', 'Old bot')
+                    ) VALUES ('tenant', 'cli_app', 'old-secret', 'old-code', 'Old bot')
                     """
                 )
                 with patch(
@@ -66,7 +66,7 @@ class FeishuAppImportTests(unittest.IsolatedAsyncioTestCase):
 
                 cursor = await db.execute(
                     "SELECT * FROM feishu_tenant_app WHERE tenant_key = 'tenant' "
-                    "AND app_id = 'app'"
+                    "AND app_id = 'cli_app'"
                 )
                 row = await cursor.fetchone()
 
@@ -74,6 +74,50 @@ class FeishuAppImportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(row["app_secret"], "new-secret")
         self.assertEqual(row["bot_name"], "Renamed bot")
         self.assertEqual(row["enabled"], 1)
+
+    async def test_placeholder_app_is_not_enabled(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "feishu_apps.json"
+            config_path.write_text(
+                json.dumps({"apps": {"placeholder": {"appId": "xxx", "appSecret": "xxx"}}}),
+                encoding="utf-8",
+            )
+            async with aiosqlite.connect(":memory:") as db:
+                db.row_factory = aiosqlite.Row
+                await db.execute(
+                    """
+                    CREATE TABLE feishu_tenant_app (
+                      id INTEGER PRIMARY KEY AUTOINCREMENT,
+                      tenant_key TEXT NOT NULL,
+                      app_id TEXT NOT NULL,
+                      app_secret TEXT NOT NULL,
+                      encrypt_key TEXT,
+                      verification_token TEXT,
+                      bot_code TEXT NOT NULL UNIQUE,
+                      bot_name TEXT,
+                      enabled INTEGER NOT NULL DEFAULT 1,
+                      UNIQUE (tenant_key, app_id)
+                    )
+                    """
+                )
+                await db.execute(
+                    """
+                    INSERT INTO feishu_tenant_app (
+                      tenant_key, app_id, app_secret, bot_code, enabled
+                    ) VALUES ('', 'xxx', 'xxx', 'placeholder', 1)
+                    """
+                )
+                with patch(
+                    "app.bootstrap.get_settings",
+                    return_value=SimpleNamespace(feishu_apps_config_path=str(config_path)),
+                ):
+                    await import_feishu_apps(db)
+                cursor = await db.execute(
+                    "SELECT enabled FROM feishu_tenant_app WHERE bot_code = 'placeholder'"
+                )
+                row = await cursor.fetchone()
+
+        self.assertEqual(row["enabled"], 0)
 
 
 if __name__ == "__main__":
