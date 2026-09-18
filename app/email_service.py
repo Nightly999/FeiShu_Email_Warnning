@@ -48,7 +48,9 @@ CARD_EMAIL_DETAIL_LIMIT = 20
 
 
 class EmailPlan(BaseModel):
-    action: Literal["query", "bind", "rebind", "unbind", "status", "retention"] = "query"
+    action: Literal[
+        "query", "bind", "rebind", "unbind", "status", "retention", "unrelated"
+    ]
     lookback_hours: int = Field(default=48, ge=1, le=HISTORICAL_LOOKBACK_HOURS)
     scope: Literal["all", "to", "cc", "mentioned"] = "all"
     important_only: bool = False
@@ -93,10 +95,14 @@ def looks_like_email_request(text: str) -> bool:
 async def handle_email_command(event: dict[str, Any]) -> EmailCommandResult | None:
     settings = get_settings()
     text = str(event.get("text") or "")
-    if not settings.email_feature_enabled or not looks_like_email_request(text):
+    if not settings.email_feature_enabled:
+        return None
+    if event.get("_automation_run") and not looks_like_email_request(text):
         return None
 
     plan = await plan_email_request(text)
+    if plan.action == "unrelated":
+        return None
     scope = (event["tenant_key"], event["app_id"], event["open_id"])
     try:
         account = await get_email_account(*scope)
@@ -138,7 +144,7 @@ async def handle_email_command(event: dict[str, Any]) -> EmailCommandResult | No
 async def plan_email_request(text: str) -> EmailPlan:
     settings = get_settings()
     explicit_plan = _fallback_plan(text, settings)
-    if explicit_plan.action != "query":
+    if explicit_plan.action not in {"query", "unrelated"}:
         return explicit_plan
     tool = {
         "type": "function",
@@ -149,8 +155,11 @@ async def plan_email_request(text: str) -> EmailPlan:
         },
     }
     prompt = (
-        "必须调用 plan_email_request。绑定/重新绑定、解绑、状态、保留天数分别选择对应 action；"
-        "普通查询选择 query。未说明时间时用 48 小时；今天按当天零点至今、本周按周一零点至今；"
+        "必须调用 plan_email_request。先判断请求是否属于邮箱助手：邮箱绑定、换号、重新登录、"
+        "解绑、绑定状态、保留时间或邮件查询分别选择对应 action；与邮箱无关必须选择 unrelated，"
+        "例如‘查询生产进度’‘查询样品风险’都不是邮件请求。"
+        "不要因为表达中没有‘邮箱’二字就判定无关，例如‘更换账号’‘重新登录’属于 rebind。"
+        "普通邮件查询选择 query。未说明时间时用 48 小时；今天按当天零点至今、本周按周一零点至今；"
         "把用户要求的邮件数量写入 limit（最多100）；用户要求历史邮件但未指定日期时，"
         f"lookback_hours 设为 {HISTORICAL_LOOKBACK_HOURS}；指定发件人、主题、正文关键词时分别填写"
         " sender_contains、subject_contains、keywords；‘第1封/第3封’按从新到旧写入"
@@ -173,7 +182,7 @@ async def plan_email_request(text: str) -> EmailPlan:
             return _validated_plan(plan, settings, text)
     except (ModelFallbackError, ValidationError, ValueError, TypeError):
         logger.warning("Email request planning failed; using deterministic fallback", exc_info=True)
-    return _fallback_plan(text, settings)
+    return explicit_plan
 
 
 def _validated_plan(plan: EmailPlan, settings, text: str = "") -> EmailPlan:
@@ -211,6 +220,8 @@ def _fallback_plan(text: str, settings) -> EmailPlan:
     if retention:
         days = max(settings.email_min_retention_days, min(settings.email_max_retention_days, int(retention.group(1))))
         return EmailPlan(action="retention", retention_days=days)
+    if not looks_like_email_request(text):
+        return EmailPlan(action="unrelated")
     hours = settings.email_initial_lookback_hours
     now = datetime.now(timezone(timedelta(hours=8)))
     if "今天" in text or "当天" in text:
@@ -225,6 +236,7 @@ def _fallback_plan(text: str, settings) -> EmailPlan:
     controls["lookback_hours"] = hours
     scope = "cc" if "抄送" in text else "to" if "收件人" in text else "mentioned" if "提到我" in text or "@我" in text else "all"
     return EmailPlan(
+        action="query",
         scope=scope,
         important_only="重要" in text or "紧急" in text,
         **controls,

@@ -24,6 +24,7 @@ from app.email_service import (
     build_email_report_card,
     plan_email_request,
     sync_analyze_report,
+    handle_email_command,
 )
 from app.feishu import TenantApp
 from app.feishu_ws import (
@@ -132,9 +133,57 @@ def test_explicit_email_login_skips_model_planning(
     model.assert_not_awaited()
 
 
+def test_model_recognizes_dynamic_email_account_command(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    response = type(
+        "Response",
+        (),
+        {"tool_calls": [{"name": "plan_email_request", "args": {"action": "rebind"}}]},
+    )()
+    monkeypatch.setattr(
+        "app.email_service.invoke_chat_with_fallback",
+        AsyncMock(return_value=response),
+    )
+
+    plan = asyncio.run(plan_email_request("更换账号"))
+
+    assert plan.action == "rebind"
+
+
+def test_unrelated_command_returns_to_general_agent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    response = type(
+        "Response",
+        (),
+        {"tool_calls": [{"name": "plan_email_request", "args": {"action": "unrelated"}}]},
+    )()
+    account_lookup = AsyncMock()
+    monkeypatch.setattr(
+        "app.email_service.invoke_chat_with_fallback",
+        AsyncMock(return_value=response),
+    )
+    monkeypatch.setattr("app.email_service.get_email_account", account_lookup)
+
+    result = asyncio.run(
+        handle_email_command(
+            {
+                "text": "查询生产进度",
+                "tenant_key": "tenant",
+                "app_id": "app",
+                "open_id": "user",
+            }
+        )
+    )
+
+    assert result is None
+    account_lookup.assert_not_awaited()
+
+
 def test_explicit_numbers_override_inconsistent_model_plan() -> None:
     plan = _validated_plan(
-        EmailPlan(lookback_hours=48, limit=3, only_unprocessed=False),
+        EmailPlan(action="query", lookback_hours=48, limit=3, only_unprocessed=False),
         get_settings(),
         "分析最近7天的前5封未处理邮件",
     )
@@ -172,6 +221,7 @@ def test_email_plan_selects_requested_messages_before_analysis() -> None:
         },
     ]
     plan = EmailPlan(
+        action="query",
         sender_contains="张三",
         keywords=["项目甲"],
         message_positions=[2],
@@ -208,7 +258,7 @@ def test_analysis_failure_is_not_reported_as_no_matching_email(
         sync_analyze_report(
             {"message_id": "message-1"},
             {"id": 1, "email_address": "user@example.com", "retention_days": 7},
-            EmailPlan(),
+            EmailPlan(action="query"),
         )
     )
 
@@ -250,7 +300,7 @@ def test_scheduled_report_keeps_previously_pushed_email(
         sync_analyze_report(
             {"message_id": "scheduled:6:run", "_automation_run": True, "_email_task_id": 6},
             {"id": 1, "email_address": "user@example.com", "retention_days": 7},
-            EmailPlan(lookback_hours=48),
+            EmailPlan(action="query", lookback_hours=48),
         )
     )
 
@@ -328,7 +378,7 @@ def test_partial_analysis_failure_is_visible_to_user(
         sync_analyze_report(
             {"message_id": "message-1"},
             {"id": 1, "email_address": "user@example.com", "retention_days": 7},
-            EmailPlan(),
+            EmailPlan(action="query"),
         )
     )
 
@@ -383,7 +433,7 @@ def test_email_report_card_is_an_ai_briefing_without_table() -> None:
                 "attachments_json": '[{"name":"quote.pdf"}]',
             }
         ],
-        EmailPlan(),
+        EmailPlan(action="query"),
     )
 
     assert card["header"]["title"]["content"] == "邮件分析简报"
@@ -413,7 +463,9 @@ def test_history_report_card_states_when_details_are_truncated() -> None:
     ]
 
     card = build_email_report_card(
-        {"email_address": "user@example.com"}, messages, EmailPlan(limit=80)
+        {"email_address": "user@example.com"},
+        messages,
+        EmailPlan(action="query", limit=80),
     )
     content = "\n".join(item.get("content", "") for item in card["body"]["elements"])
 
