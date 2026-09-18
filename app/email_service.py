@@ -30,7 +30,6 @@ from app.email_repository import (
     mark_analysis_failed,
     save_analysis,
     save_messages,
-    successful_scheduled_message_ids,
     update_retention,
     update_sync_result,
     upsert_email_account,
@@ -43,14 +42,17 @@ from app.settings import get_settings
 
 logger = logging.getLogger("email_feature")
 EMAIL_WORDS = ("邮件", "邮箱", "收件箱", "抄送", "email", "mail")
+MAX_EMAIL_QUERY_MESSAGES = 9999
+HISTORICAL_LOOKBACK_HOURS = 24 * 365 * 10
+CARD_EMAIL_DETAIL_LIMIT = 20
 
 
 class EmailPlan(BaseModel):
     action: Literal["query", "bind", "rebind", "unbind", "status", "retention"] = "query"
-    lookback_hours: int = Field(default=48, ge=1, le=720)
+    lookback_hours: int = Field(default=48, ge=1, le=HISTORICAL_LOOKBACK_HOURS)
     scope: Literal["all", "to", "cc", "mentioned"] = "all"
     important_only: bool = False
-    limit: int = Field(default=20, ge=1, le=20)
+    limit: int = Field(default=20, ge=1, le=MAX_EMAIL_QUERY_MESSAGES)
     sender_contains: str | None = Field(default=None, max_length=200)
     subject_contains: str | None = Field(default=None, max_length=200)
     keywords: list[str] = Field(default_factory=list, max_length=10)
@@ -79,7 +81,6 @@ class EmailAnalysisBatch(BaseModel):
 class EmailCommandResult:
     answer: str
     card: dict[str, Any] | None = None
-    message_ids: list[int] | None = None
     run_ref: str | None = None
     status: str = "success"
 
@@ -136,6 +137,9 @@ async def handle_email_command(event: dict[str, Any]) -> EmailCommandResult | No
 
 async def plan_email_request(text: str) -> EmailPlan:
     settings = get_settings()
+    explicit_plan = _fallback_plan(text, settings)
+    if explicit_plan.action != "query":
+        return explicit_plan
     tool = {
         "type": "function",
         "function": {
@@ -147,7 +151,8 @@ async def plan_email_request(text: str) -> EmailPlan:
     prompt = (
         "必须调用 plan_email_request。绑定/重新绑定、解绑、状态、保留天数分别选择对应 action；"
         "普通查询选择 query。未说明时间时用 48 小时；今天按当天零点至今、本周按周一零点至今；"
-        "把用户要求的邮件数量写入 limit（最多20）；指定发件人、主题、正文关键词时分别填写"
+        "把用户要求的邮件数量写入 limit（最多100）；用户要求历史邮件但未指定日期时，"
+        f"lookback_hours 设为 {HISTORICAL_LOOKBACK_HOURS}；指定发件人、主题、正文关键词时分别填写"
         " sender_contains、subject_contains、keywords；‘第1封/第3封’按从新到旧写入"
         " message_positions；‘未读/未处理/新邮件’设置 only_unprocessed=true。"
         "不要补充用户没有提出的筛选条件。当前北京时间："
@@ -185,7 +190,15 @@ def _validated_plan(plan: EmailPlan, settings, text: str = "") -> EmailPlan:
 def _fallback_plan(text: str, settings) -> EmailPlan:
     if any(
         word in text
-        for word in ("重新绑定", "重新登录", "更换邮箱", "修改邮箱", "更换密码")
+        for word in (
+            "登录邮箱",
+            "邮箱登录",
+            "重新绑定",
+            "重新登录",
+            "更换邮箱",
+            "修改邮箱",
+            "更换密码",
+        )
     ):
         return EmailPlan(action="rebind")
     if any(word in text for word in ("解绑", "解除绑定")):
@@ -220,15 +233,25 @@ def _fallback_plan(text: str, settings) -> EmailPlan:
 
 def _explicit_query_controls(text: str) -> dict[str, Any]:
     controls: dict[str, Any] = {}
+    if "历史" in text:
+        controls["lookback_hours"] = HISTORICAL_LOOKBACK_HOURS
     day_match = re.search(r"(?:最近|过去)?\s*(\d{1,2})\s*天", text)
     if day_match:
-        controls["lookback_hours"] = min(720, int(day_match.group(1)) * 24)
+        controls["lookback_hours"] = min(
+            HISTORICAL_LOOKBACK_HOURS, int(day_match.group(1)) * 24
+        )
     hour_match = re.search(r"(?:最近|过去)?\s*(\d{1,3})\s*小时", text)
     if hour_match:
-        controls["lookback_hours"] = min(720, max(1, int(hour_match.group(1))))
-    count_match = re.search(r"(?:前|最近|查看|查询|分析)?\s*(\d{1,2})\s*封", text)
+        controls["lookback_hours"] = min(
+            HISTORICAL_LOOKBACK_HOURS, max(1, int(hour_match.group(1)))
+        )
+    count_match = re.search(
+        r"(?:前|最近|查看|查询|分析)?\s*(\d{1,3})\s*(?:封|份)", text
+    )
     if count_match:
-        controls["limit"] = min(20, max(1, int(count_match.group(1))))
+        controls["limit"] = min(
+            MAX_EMAIL_QUERY_MESSAGES, max(1, int(count_match.group(1)))
+        )
     positions = [int(value) for value in re.findall(r"第\s*(\d{1,2})\s*封", text)]
     if positions:
         controls["message_positions"] = positions[:20]
@@ -284,7 +307,7 @@ async def sync_account(account: dict[str, Any], *, lookback_hours: int, max_mess
             username=account["email_address"],
             password=decrypt_email_password(account["password_ciphertext"]),
             timeout=settings.email_pop3_timeout_seconds,
-            lookback_hours=min(720, max(1, lookback_hours)),
+            lookback_hours=min(HISTORICAL_LOOKBACK_HOURS, max(1, lookback_hours)),
             max_messages=min(100, max(1, max_messages)),
             max_body_chars=settings.email_max_body_chars,
             known_uidls=existing,
@@ -319,9 +342,6 @@ async def sync_analyze_report(
     messages = await list_recent_messages(int(account["id"]), plan.lookback_hours)
     display_name = await _display_name(event)
     selected = [item for item in messages if _matches(item, account["email_address"], display_name, plan.scope)]
-    if event.get("_automation_run"):
-        pushed = await successful_scheduled_message_ids(int(account["id"]))
-        selected = [item for item in selected if int(item["id"]) not in pushed]
     selected = _select_messages(selected, plan)
     await analyze_pending(
         selected,
@@ -358,7 +378,7 @@ async def sync_analyze_report(
     task_ref = str(event.get("_email_task_id") or "")
     if message_ids:
         await create_push_logs(message_ids, push_type, task_ref, run_ref)
-    return EmailCommandResult(answer, card=card, message_ids=message_ids, run_ref=run_ref)
+    return EmailCommandResult(answer, card=card, run_ref=run_ref)
 
 
 async def analyze_pending(
@@ -370,8 +390,21 @@ async def analyze_pending(
     pending = [item for item in messages if not item.get("summary")]
     for start in range(0, len(pending), 8):
         batch = pending[start : start + 8]
+        failed_ids: set[int] = set()
         try:
             analyses = await _analyze_batch(batch, email_address, display_name)
+        except (ValidationError, ValueError):
+            logger.warning("Email analysis batch was invalid; retrying individually", exc_info=True)
+            analyses = []
+            for item in batch:
+                try:
+                    analyses.extend(
+                        await _analyze_batch([item], email_address, display_name)
+                    )
+                except Exception as exc:
+                    message_id = int(item["id"])
+                    failed_ids.add(message_id)
+                    await mark_analysis_failed(message_id, _safe_error(exc))
         except Exception as exc:
             logger.exception("Email analysis batch failed")
             for item in batch:
@@ -381,12 +414,15 @@ async def analyze_pending(
         model_chain = select_model_chain("text")
         model_name = model_chain[0].id if model_chain else "unknown"
         for message in batch:
-            analysis = by_id.get(int(message["id"]))
+            message_id = int(message["id"])
+            if message_id in failed_ids:
+                continue
+            analysis = by_id.get(message_id)
             if not analysis:
-                await mark_analysis_failed(int(message["id"]), "模型未返回该邮件的分析结果")
+                await mark_analysis_failed(message_id, "模型未返回该邮件的分析结果")
                 continue
             await save_analysis(
-                int(message["id"]),
+                message_id,
                 analysis.model_dump(),
                 model_name,
                 retention_days,
@@ -492,12 +528,17 @@ def build_email_report_card(
     account: dict[str, Any], messages: list[dict[str, Any]], plan: EmailPlan
 ) -> dict[str, Any]:
     masked_email = escape_lark_md(_mask_email(account["email_address"]))
+    range_label = (
+        "历史邮件"
+        if plan.lookback_hours >= HISTORICAL_LOOKBACK_HOURS
+        else f"最近 {plan.lookback_hours} 小时"
+    )
     if not messages:
         elements = [
             {
                 "tag": "markdown",
                 "content": (
-                    f"**{masked_email}** · 最近 {plan.lookback_hours} 小时\n\n"
+                    f"**{masked_email}** · {range_label}\n\n"
                     "没有发现符合当前筛选条件的邮件。"
                 ),
             }
@@ -509,14 +550,14 @@ def build_email_report_card(
             {
                 "tag": "markdown",
                 "content": (
-                    f"**{masked_email}** · 最近 {plan.lookback_hours} 小时\n\n"
+                    f"**{masked_email}** · {range_label}\n\n"
                     f"共 **{len(messages)}** 封 · 高优先级 **{high}** 封 · "
                     f"需要关注 **{attention}** 封"
                 ),
             },
             {"tag": "hr"},
         ]
-        for index, item in enumerate(messages, 1):
+        for index, item in enumerate(messages[:CARD_EMAIL_DETAIL_LIMIT], 1):
             importance = item.get("importance") or "未分析"
             icon = {"高": "🔴", "中": "🟠", "低": "🟢"}.get(importance, "⚪")
             subject = escape_lark_md(str(item.get("subject") or "（无主题）"))
@@ -531,7 +572,7 @@ def build_email_report_card(
                 f"{icon} **{index}. {subject}**",
                 f"<font color=\"grey\">{sender} · {escape_lark_md(str(item.get('relation_type') or '其他'))}</font>",
                 "",
-                f"**AI 摘要**　{summary}",
+                f"**分析结果**　{summary}",
                 f"**需要你做**　{escape_lark_md('；'.join(todos) if todos else '无明确待办')}",
             ]
             if item.get("possible_owner") or item.get("deadline"):
@@ -550,6 +591,16 @@ def build_email_report_card(
                     "content": trim_text("\n".join(lines), 5200),
                 }
             )
+        if len(messages) > CARD_EMAIL_DETAIL_LIMIT:
+            elements.append(
+                {
+                    "tag": "markdown",
+                    "content": (
+                        f"已完成 **{len(messages)}** 封邮件分析；受单张飞书卡片长度限制，"
+                        f"当前展示最新 **{CARD_EMAIL_DETAIL_LIMIT}** 封。"
+                    ),
+                }
+            )
     return {
         "schema": "2.0",
         "config": {
@@ -559,7 +610,7 @@ def build_email_report_card(
         },
         "header": {
             "template": "blue",
-            "title": {"tag": "plain_text", "content": "📬 AI 邮件智能简报"},
+            "title": {"tag": "plain_text", "content": "邮件分析简报"},
         },
         "body": {"elements": elements[:24]},
     }
@@ -741,7 +792,7 @@ def _select_messages(
             for position in dict.fromkeys(plan.message_positions)
             if 1 <= position <= len(selected)
         ]
-    return selected[: (20 if plan.important_only else plan.limit)]
+    return selected[: plan.limit]
 
 
 def _relation(message: dict[str, Any], email_address: str, display_name: str) -> str:
@@ -785,4 +836,8 @@ def _safe_error(exc: Exception) -> str:
         return "邮箱认证失败"
     if isinstance(exc, EmailConnectionError):
         return "POP3 连接失败"
+    if isinstance(exc, ModelFallbackError):
+        return "大模型服务调用失败"
+    if isinstance(exc, ValidationError):
+        return "模型结构化结果校验失败"
     return type(exc).__name__

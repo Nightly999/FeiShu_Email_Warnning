@@ -11,7 +11,7 @@ def test_business_text_containing_exception_word_is_not_an_error() -> None:
 
     card = build_answer_card("帮我分析今年销售趋势", answer)
     assert card["header"]["template"] == "green"
-    assert card["header"]["title"]["content"] == "查询结果"
+    assert card["header"]["title"]["content"] == "邮件处理结果"
 
 
 def test_explicit_processing_failure_uses_error_card() -> None:
@@ -19,7 +19,7 @@ def test_explicit_processing_failure_uses_error_card() -> None:
 
     card = build_answer_card("分析文件", answer, status="error")
     assert card["header"]["template"] == "red"
-    assert card["header"]["title"]["content"] == "处理失败"
+    assert card["header"]["title"]["content"] == "邮件处理失败"
 
 
 def test_answer_words_do_not_override_explicit_status() -> None:
@@ -30,7 +30,7 @@ def test_answer_words_do_not_override_explicit_status() -> None:
     )
 
     assert card["header"]["template"] == "green"
-    assert card["header"]["title"]["content"] == "查询结果"
+    assert card["header"]["title"]["content"] == "邮件处理结果"
 
 
 def test_scheduled_task_card_supports_custom_title_and_footer() -> None:

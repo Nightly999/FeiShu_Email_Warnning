@@ -18,7 +18,7 @@ def normalize_answer_for_card(answer: str) -> str:
     text = (answer or "").strip()
     text = normalize_headings(text)
     text = normalize_horizontal_rules(text)
-    return text or "已处理，但没有生成可展示的内容。"
+    return text or "邮件已处理，但没有生成可展示的分析结果。"
 
 
 def parse_markdown_row(line: str) -> list[str] | None:
@@ -177,15 +177,15 @@ def build_processing_card(question: str) -> dict[str, Any]:
         "config": {"wide_screen_mode": True, "update_multi": True},
         "header": {
             "template": "blue",
-            "title": {"tag": "plain_text", "content": "正在思考..."},
+            "title": {"tag": "plain_text", "content": "正在分析邮件..."},
         },
         "body": {
             "elements": [
                 {
                     "tag": "markdown",
                     "content": (
-                        "已收到你的问题，正在核验权限、调用业务系统并整理结果。\n\n"
-                        f"**问题**：{escape_lark_md(trim_text(question, 500))}"
+                        "正在理解您的指令、同步并分析相关邮件，请稍候。\n\n"
+                        f"**您的指令**：{escape_lark_md(trim_text(question, 500))}"
                     ),
                 }
             ]
@@ -199,65 +199,57 @@ def build_welcome_card() -> dict[str, Any]:
         "config": {"wide_screen_mode": True, "update_multi": True},
         "header": {
             "template": "green",
-            "title": {"tag": "plain_text", "content": "ASI采购库存查询助手 📋"},
+            "title": {"tag": "plain_text", "content": "来邮速递｜AI 邮件助手 📬"},
         },
         "body": {
             "elements": [
                 {
                     "tag": "markdown",
                     "content": (
-                        "我是 **ASI采购库存查询助手**，专注工厂订单和样品的在制品跟踪。"
-                        "你可以直接告诉我查询、分析、导出或定时推送需求。"
+                        "我可以按你的指令同步、筛选和分析公司邮箱，"
+                        "并将邮件简报私聊发送给你。"
                     ),
                 },
                 {"tag": "hr"},
                 {
                     "tag": "markdown",
                     "content": (
-                        "**📦 库存查询与分析**\n"
-                        "- 查询集团 ERP、事业一部 / 二部 ERP、越南 ERP 库存数据\n"
-                        "- 按集团色号、存货大类、名称、规格、颜色等条件筛选\n"
-                        "- 查看生产订单需求、规划需求、MRP / 非 MRP 库存、采购在途、请购量等"
+                        "**🔐 绑定邮箱**\n"
+                        "- 首次发送“分析我的邮箱”，按卡片提示填写邮箱账号和密码\n"
+                        "- 发送“重新绑定邮箱”可以覆盖原绑定"
                     ),
                 },
                 {
                     "tag": "markdown",
                     "content": (
-                        "**📊 核心指标监控**\n"
-                        "- 库存汇总概览\n"
-                        "- 安全库存预警（可用量低于警戒点）\n"
-                        "- 库存短缺分析（净缺口分析）"
+                        "**📨 查询与分析**\n"
+                        "- 可指定最近几小时或几天、邮件数量、发件人和关键词\n"
+                        "- 支持筛选未处理、收件人、抄送和正文提及你的邮件\n"
+                        "- 输出摘要、优先级、待办、负责人、截止时间、风险和附件"
                     ),
                 },
                 {
                     "tag": "markdown",
                     "content": (
-                        "**📈 采购与生产**\n"
-                        "- 按系统和存货大类汇总采购数据\n"
-                        "- 采购订单执行进度统计\n"
-                        "- 生产进度报告查询"
-                    ),
-                },
-                {
-                    "tag": "markdown",
-                    "content": (
-                        "**📤 数据导出**\n"
-                        "- 可以把查询结果导出 Excel 并通过飞书发给你"
-                    ),
-                },
-                {
-                    "tag": "markdown",
-                    "content": (
-                        "**⏰ 定时数据推送**\n"
-                        "- 可以设置推送时间，自动将查询结果通过飞书发送给你"
+                        "**⏰ 定时邮件简报**\n"
+                        "- 可用自然语言设置每天一个或多个推送时间\n"
+                        "- 到点自动同步、分析邮件，并私聊发送结果\n"
+                        "- 支持查看、修改或取消定时任务"
                     ),
                 },
                 {"tag": "hr"},
                 {
                     "tag": "markdown",
                     "content": (
-                        "💡 **示例**：查一下集团 ERP 里色号 XXX 的库存\n"
-                        "💡 **示例**：看看有哪些物料安全库存不足"
+                        "💡 **示例**：分析最近两天的未读邮件\n"
+                        "💡 **示例**：每天 9:30 和 17:20 分析未处理邮件并推送给我"
+                    ),
+                },
+                {
+                    "tag": "markdown",
+                    "content": (
+                        "<font color=\"grey\">邮箱密码仅用于 POP3 登录验证，不用于模型训练。"
+                        "</font>"
                     ),
                 },
             ]
@@ -271,14 +263,14 @@ def build_answer_card(
     *,
     status: str = "success",
     title: str | None = None,
-    footer_label: str = "问题",
+    footer_label: str = "您的指令",
 ) -> dict[str, Any]:
     content = normalize_answer_for_card(answer)
     template, default_title = {
-        "success": ("green", "查询结果"),
-        "error": ("red", "处理失败"),
-        "denied": ("orange", "权限提示"),
-    }.get(status, ("green", "查询结果"))
+        "success": ("green", "邮件处理结果"),
+        "error": ("red", "邮件处理失败"),
+        "denied": ("orange", "操作提示"),
+    }.get(status, ("green", "邮件处理结果"))
     card_title = title or default_title
     dynamic_elements = _enforce_table_limit(_build_dynamic_elements(content))
     dynamic_elements = _limit_elements_preserving_tail(
@@ -439,7 +431,7 @@ def _build_dynamic_elements(content: str) -> list[dict[str, Any]]:
         index += 1
 
     flush_all()
-    return elements or [{"tag": "markdown", "content": "已处理。"}]
+    return elements or [{"tag": "markdown", "content": "邮件处理完成。"}]
 
 
 def _collect_markdown_table(lines: list[str], start: int) -> tuple[list[str], list[list[str]], int] | None:

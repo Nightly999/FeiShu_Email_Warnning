@@ -30,7 +30,7 @@ def parse_schedule_command(text: str) -> dict[str, str] | None:
     explicit_name, text = extract_outer_task_name(text)
     explicit_mode, text = extract_execution_mode(text)
     list_match = re.match(
-        r"^(?:查看|列出|显示)?\s*(?:(?:我的|我创建的|全部)\s*)?"
+        r"^(?:查看|查询|列出|显示)?\s*(?:(?:我的|我创建的|全部)\s*)?"
         r"定时任务(?:列表)?(?:\s*第?\s*(\d+)\s*页)?$",
         text,
     )
@@ -52,6 +52,11 @@ def parse_schedule_command(text: str) -> dict[str, str] | None:
             "task_id": history.group(1),
             "page": history.group(2) or "1",
         }
+    if re.match(
+        r"^我(?:现在)?(?:有|创建了|设置了)?\s*(?:几个|多少个?|哪些)\s*定时任务$",
+        text,
+    ):
+        return {"schedule_type": "list", "page": "1"}
 
     if re.match(
         r"^(?:取消|删除|删掉|移除|清空)\s*(?:我的\s*)?"
@@ -259,7 +264,7 @@ async def resolve_schedule_command(
     }
     if command and command.get("schedule_type") in management_types:
         if command.get("schedule_type") == "invalid" and looks_like_email_schedule(text):
-            command["help_text"] = email_schedule_help_text()
+            command["help_text"] = schedule_help_text()
         return command
 
     original_request = referenced_request_text or ""
@@ -271,6 +276,10 @@ async def resolve_schedule_command(
         is_schedule_creation_intent(text)
         or (command and command.get("schedule_type") == "help")
         or (original_request and is_execution_mode_reply(text))
+        or (
+            command is None
+            and any(word in text for word in ("定时任务", "定时安排", "计划任务"))
+        )
     )
     if not should_plan:
         return command
@@ -287,7 +296,7 @@ async def resolve_schedule_command(
             return command
         result = invalid_time_command(str(exc))
         if looks_like_email_schedule(text):
-            result["help_text"] = email_schedule_help_text()
+            result["help_text"] = schedule_help_text()
         return result
 
 
@@ -296,6 +305,18 @@ def schedule_plan_to_command(plan: SchedulePlan) -> dict[str, str]:
         return invalid_time_command(
             (plan.clarification or "请补充执行时间和任务内容。").strip()
         )
+    if plan.action in {"list", "cancel_all"}:
+        command = {"schedule_type": plan.action}
+        if plan.action == "list":
+            command["page"] = str(plan.page or 1)
+        return command
+    if plan.action in {"history", "cancel", "pause", "resume", "run_now"}:
+        if not plan.task_id:
+            return invalid_time_command("请提供要操作的定时任务编号。")
+        command = {"schedule_type": plan.action, "task_id": str(plan.task_id)}
+        if plan.action == "history":
+            command["page"] = str(plan.page or 1)
+        return command
     prompt = plan.prompt.strip()
     if not prompt:
         return invalid_time_command("缺少定时任务的执行内容。")
@@ -513,24 +534,13 @@ async def handle_schedule_command(app: TenantApp, event: dict[str, Any], command
 
 def schedule_help_text() -> str:
     return (
-        "支持两种定时任务：\n"
-        "- 提醒模式：到时间发送提醒文字。\n"
-        "- Agent 模式：到时间自动查询业务系统并推送真实结果。\n\n"
-        "创建示例：\n"
-        "- 定时 2026-08-16 18:30 提醒我提交日报\n"
-        "- 30分钟后提醒我参加会议\n"
-        "- 每天 09:00 提醒我检查生产进度\n"
-        "- 每天 09:00 查询样品风险并汇总\n\n"
-        "- Agent模式，每5分钟查询样品风险并汇总\n"
-        "- 每隔2小时提醒我检查待办\n\n"
-        "管理命令：\n"
-        "- 查看定时任务\n"
-        "- 暂停定时任务 #任务编号\n"
-        "- 恢复定时任务 #任务编号\n"
-        "- 立即执行定时任务 #任务编号\n"
-        "- 查看定时任务 #任务编号 运行记录\n"
-        "- 取消定时任务（取消当前用户的全部定时任务）\n"
-        "- 取消定时任务 #任务编号"
+        "邮箱定时分析示例：\n"
+        "- 每天 09:00 分析最近 48 小时的邮件\n"
+        "- 每天 09:30 和 17:20 分析未处理邮件并私聊推送\n"
+        "- 每天晚上 9 点分析最近 7 天发件人为xxx的邮件\n"
+        "- 每隔 2 小时分析前 5 封高优先级邮件\n\n"
+        "可动态指定：时间范围、邮件数量、发件人、主题、正文关键词、"
+        "收件人、抄送和重要程度。\n\n"
     )
 
 
@@ -883,17 +893,6 @@ async def manage_scheduled_task(
     )
     return (
         f"定时任务 #{task_id}“{task['task_name'] or '未命名任务'}”已加入执行队列。"
-    )
-
-
-def email_schedule_help_text() -> str:
-    return (
-        "邮箱定时分析示例：\n"
-        "- 每天 08:20 分析未处理邮件并私聊推送\n"
-        "- 每天 08:20 和 17:20 分析最近 2 天的前 5 封邮件\n"
-        "- 每天晚上 9 点分析发件人为张三、主题包含报价的邮件\n\n"
-        "支持动态设置：时间范围、邮件数量、发件人、主题、关键词、"
-        "收件人、抄送、正文提及和重要程度。"
     )
 
 

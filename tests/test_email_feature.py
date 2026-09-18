@@ -13,13 +13,16 @@ from lark_oapi.ws.pb.pbbp2_pb2 import Frame
 from app.email_pop3 import EmailAuthenticationError, parse_message
 from app.email_security import decrypt_email_password, encrypt_email_password
 from app.email_service import (
+    EmailAnalysis,
     EmailPlan,
     _fallback_plan,
     _select_messages,
     _validated_plan,
+    analyze_pending,
     build_email_login_card,
     build_email_report,
     build_email_report_card,
+    plan_email_request,
     sync_analyze_report,
 )
 from app.feishu import TenantApp
@@ -104,11 +107,29 @@ def test_email_fallback_plan_applies_scope_and_bounds() -> None:
     assert retention.action == "retention"
     assert retention.retention_days == settings.email_max_retention_days
     assert _fallback_plan("重新登录邮箱", settings).action == "rebind"
+    assert _fallback_plan("登录邮箱", settings).action == "rebind"
+    assert _fallback_plan("邮箱登录", settings).action == "rebind"
 
     hourly = _fallback_plan("分析最近12小时的前5封未处理邮件", settings)
     assert hourly.lookback_hours == 12
     assert hourly.limit == 5
     assert hourly.only_unprocessed is True
+
+    history = _fallback_plan("帮我分析历史邮件前80份", settings)
+    assert history.lookback_hours == 24 * 365 * 10
+    assert history.limit == 80
+
+
+def test_explicit_email_login_skips_model_planning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = AsyncMock()
+    monkeypatch.setattr("app.email_service.invoke_chat_with_fallback", model)
+
+    plan = asyncio.run(plan_email_request("登录邮箱"))
+
+    assert plan.action == "rebind"
+    model.assert_not_awaited()
 
 
 def test_explicit_numbers_override_inconsistent_model_plan() -> None:
@@ -193,6 +214,76 @@ def test_analysis_failure_is_not_reported_as_no_matching_email(
 
     assert result.status == "error"
     assert "大模型分析暂时不可用" in result.answer
+
+
+def test_scheduled_report_keeps_previously_pushed_email(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    message = {
+        "id": 314,
+        "subject": "Microsoft Outlook 测试消息",
+        "sender_name": "Microsoft Outlook",
+        "sender_address": "support@example.com",
+        "to_json": '[{"address":"user@example.com"}]',
+        "cc_json": "[]",
+        "text_body": "测试邮件",
+        "html_body": "",
+        "analysis_status": "success",
+        "summary": "账户设置测试邮件。",
+        "importance": "低",
+        "requires_attention": False,
+        "relation_type": "To",
+        "todos_json": "[]",
+        "risks_json": "[]",
+        "attachments_json": "[]",
+    }
+    monkeypatch.setattr("app.email_service.sync_account", AsyncMock(return_value=0))
+    monkeypatch.setattr(
+        "app.email_service.list_recent_messages",
+        AsyncMock(side_effect=[[message], [message]]),
+    )
+    monkeypatch.setattr("app.email_service._display_name", AsyncMock(return_value=""))
+    monkeypatch.setattr("app.email_service.analyze_pending", AsyncMock())
+    monkeypatch.setattr("app.email_service.create_push_logs", AsyncMock())
+
+    result = asyncio.run(
+        sync_analyze_report(
+            {"message_id": "scheduled:6:run", "_automation_run": True, "_email_task_id": 6},
+            {"id": 1, "email_address": "user@example.com", "retention_days": 7},
+            EmailPlan(lookback_hours=48),
+        )
+    )
+
+    assert result.status == "success"
+    assert "Microsoft Outlook 测试消息" in result.answer
+
+
+def test_invalid_analysis_batch_retries_each_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    messages = [{"id": 1, "summary": None}, {"id": 2, "summary": None}]
+    analyses = [
+        EmailAnalysis(
+            message_id=message_id,
+            summary=f"摘要 {message_id}",
+            importance="中",
+            requires_attention=True,
+            relation_type="To",
+        )
+        for message_id in (1, 2)
+    ]
+    analyze = AsyncMock(side_effect=[ValueError("invalid batch"), [analyses[0]], [analyses[1]]])
+    save = AsyncMock()
+    failed = AsyncMock()
+    monkeypatch.setattr("app.email_service._analyze_batch", analyze)
+    monkeypatch.setattr("app.email_service.save_analysis", save)
+    monkeypatch.setattr("app.email_service.mark_analysis_failed", failed)
+
+    asyncio.run(analyze_pending(messages, 7, "user@example.com", "User"))
+
+    assert analyze.await_count == 3
+    assert save.await_count == 2
+    failed.assert_not_awaited()
 
 
 def test_partial_analysis_failure_is_visible_to_user(
@@ -295,14 +386,42 @@ def test_email_report_card_is_an_ai_briefing_without_table() -> None:
         EmailPlan(),
     )
 
-    assert card["header"]["title"]["content"] == "📬 AI 邮件智能简报"
+    assert card["header"]["title"]["content"] == "邮件分析简报"
     assert all(item["tag"] != "table" for item in card["body"]["elements"])
     content = "\n".join(
         item.get("content", "") for item in card["body"]["elements"]
     )
-    assert "AI 摘要" in content
+    assert "分析结果" in content
     assert "确认报价并回复" in content
     assert "逾期可能影响交付" in content
+
+
+def test_history_report_card_states_when_details_are_truncated() -> None:
+    messages = [
+        {
+            "subject": f"历史邮件 {index}",
+            "sender_address": "sender@example.com",
+            "importance": "中",
+            "requires_attention": False,
+            "relation_type": "To",
+            "summary": "测试摘要",
+            "todos_json": "[]",
+            "risks_json": "[]",
+            "attachments_json": "[]",
+        }
+        for index in range(1, 81)
+    ]
+
+    card = build_email_report_card(
+        {"email_address": "user@example.com"}, messages, EmailPlan(limit=80)
+    )
+    content = "\n".join(item.get("content", "") for item in card["body"]["elements"])
+
+    assert "共 **80** 封" in content
+    assert "历史邮件" in content
+    assert "87600" not in content
+    assert "已完成 **80** 封邮件分析" in content
+    assert "最新 **20** 封" in content
 
 
 def test_bind_card_uses_password_input_and_show_toggle() -> None:

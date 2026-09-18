@@ -27,6 +27,8 @@ TEXT_TOOL_PARAMETER_PATTERN = re.compile(
 )
 SCHEDULE_PLAN_FIELDS = {
     "action",
+    "task_id",
+    "page",
     "schedule_type",
     "run_at",
     "daily_time",
@@ -46,7 +48,12 @@ class SchedulePlanError(RuntimeError):
 class SchedulePlan(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
-    action: Literal["create", "clarify"]
+    action: Literal[
+        "create", "list", "history", "cancel_all", "cancel", "pause",
+        "resume", "run_now", "clarify",
+    ]
+    task_id: int | None = None
+    page: int | None = None
     schedule_type: Literal["once", "daily", "daily_multi", "interval"] | None = None
     run_at: str | None = None
     daily_time: str | None = None
@@ -66,7 +73,15 @@ SCHEDULE_TOOL = {
         "parameters": {
             "type": "object",
             "properties": {
-                "action": {"type": "string", "enum": ["create", "clarify"]},
+                "action": {
+                    "type": "string",
+                    "enum": [
+                        "create", "list", "history", "cancel_all", "cancel",
+                        "pause", "resume", "run_now", "clarify",
+                    ],
+                },
+                "task_id": {"type": ["integer", "null"]},
+                "page": {"type": ["integer", "null"]},
                 "schedule_type": {
                     "type": ["string", "null"],
                     "enum": ["once", "daily", "daily_multi", "interval", None],
@@ -88,6 +103,8 @@ SCHEDULE_TOOL = {
             },
             "required": [
                 "action",
+                "task_id",
+                "page",
                 "schedule_type",
                 "run_at",
                 "daily_time",
@@ -108,14 +125,16 @@ SCHEDULE_PLANNER_PROMPT = """
 你是企业飞书助手的定时任务规划代理。你必须调用 plan_scheduled_task 工具，不能直接回答。
 
 规则：
-1. 从用户原始请求中提取执行时间和任务目标，不要生成代码、SQL 或 MCP 工具名。
-2. daily 使用 24 小时制 HH:MM；一天多个时间使用 daily_multi，并把所有 HH:MM 放入 daily_times；once 使用 YYYY-MM-DD HH:MM；interval 使用整数分钟。
-3. 需要届时查询、分析或汇总业务系统真实数据的任务使用 agent。只发送固定提醒文字的任务使用 reminder。
-4. “查询预计日期前三天仍未完成并通知我”属于 agent，而“提醒我提交日报”属于 reminder。
-5. prompt 保存届时交给 Agent 或提醒器的完整目标，删除“创建定时任务”“开始执行内容是”等外层措辞。
-6. 如果用户明确补充了 Agent/提醒模式，以补充内容为准。
-7. 缺少执行时间或任务内容时 action=clarify，并在 clarification 中只询问缺少的信息；不要猜测。
-8. original_request 是引用回复链中的原始创建请求，follow_up 是用户当前补充。两者存在时合并理解。
+1. 先识别用户要创建还是管理定时任务。查询、列出、有几个、有哪些任务使用 list；查看执行记录使用 history；删除全部使用 cancel_all；删除、暂停、恢复、立即执行分别使用 cancel、pause、resume、run_now。
+2. 管理单个任务时提取 task_id；list 和 history 可提取 page。缺少必需的任务编号时 action=clarify，只询问编号。
+3. 创建任务时从原始请求中提取执行时间和任务目标，不要生成代码、SQL 或 MCP 工具名。
+4. daily 使用 24 小时制 HH:MM；一天多个时间使用 daily_multi，并把所有 HH:MM 放入 daily_times；once 使用 YYYY-MM-DD HH:MM；interval 使用整数分钟。
+5. 需要届时查询、分析或汇总业务系统真实数据的任务使用 agent。只发送固定提醒文字的任务使用 reminder。
+6. “查询预计日期前三天仍未完成并通知我”属于 agent，而“提醒我提交日报”属于 reminder。
+7. prompt 保存届时交给 Agent 或提醒器的完整目标，删除“创建定时任务”“开始执行内容是”等外层措辞。
+8. 如果用户明确补充了 Agent/提醒模式，以补充内容为准。
+9. 缺少执行时间或任务内容时 action=clarify，并在 clarification 中只询问缺少的信息；不要猜测。
+10. original_request 是引用回复链中的原始创建请求，follow_up 是用户当前补充。两者存在时合并理解。
 """
 
 

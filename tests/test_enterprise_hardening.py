@@ -345,8 +345,8 @@ class WelcomeMessageTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(send_card.await_count, 1)
         card = send_card.await_args.args[2]
         self.assertEqual(card["schema"], "2.0")
-        self.assertEqual(card["header"]["title"]["content"], "ASI采购库存查询助手 📋")
-        self.assertIn("库存查询与分析", str(card))
+        self.assertEqual(card["header"]["title"]["content"], "来邮速递｜AI 邮件助手 📬")
+        self.assertIn("查询与分析", str(card))
 
     async def test_welcome_message_retries_after_send_failure(self) -> None:
         app = tenant_app()

@@ -20,6 +20,8 @@ class ScheduleCommandTests(unittest.TestCase):
         command = parse_schedule_command("帮我创个定时任务")
         self.assertEqual(command, {"schedule_type": "help"})
         self.assertIn("每天 09:00", schedule_help_text())
+        self.assertIn("邮箱定时分析示例", schedule_help_text())
+        self.assertNotIn("生产进度", schedule_help_text())
 
     def test_daily_task_is_parsed(self) -> None:
         command = parse_schedule_command("每天 9:05 提醒我查看样品风险")
@@ -250,6 +252,27 @@ class AgentSchedulePlanningTests(unittest.IsolatedAsyncioTestCase):
                 "execution_mode": "agent",
             },
         )
+        planner.assert_awaited_once()
+
+    async def test_natural_schedule_queries_are_listed(self) -> None:
+        self.assertEqual(
+            parse_schedule_command("查询定时任务"),
+            {"schedule_type": "list", "page": "1"},
+        )
+        self.assertEqual(
+            parse_schedule_command("我有几个定时任务"),
+            {"schedule_type": "list", "page": "1"},
+        )
+
+    async def test_unrecognized_schedule_language_uses_model_plan(self) -> None:
+        plan = SchedulePlan(action="list", page=2)
+        with patch(
+            "app.scheduler.plan_schedule_creation",
+            AsyncMock(return_value=plan),
+        ) as planner:
+            command = await resolve_schedule_command("帮我看看之前的定时安排")
+
+        self.assertEqual(command, {"schedule_type": "list", "page": "2"})
         planner.assert_awaited_once()
 
     async def test_model_plan_supports_multiple_daily_times(self) -> None:

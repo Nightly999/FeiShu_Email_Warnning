@@ -364,24 +364,6 @@ def _create_push_logs(message_ids: list[int], push_type: str, task_ref: str, run
         connection.commit()
 
 
-async def successful_scheduled_message_ids(account_id: int) -> set[int]:
-    return await _run(_successful_scheduled_message_ids, account_id)
-
-
-def _successful_scheduled_message_ids(account_id: int) -> set[int]:
-    with _open_connection() as connection:
-        rows = connection.execute(
-            """
-            SELECT DISTINCT p.email_message_id
-            FROM asi.email_push_log p
-            JOIN asi.email_message m ON m.id = p.email_message_id
-            WHERE m.email_account_id = ? AND p.push_type = N'scheduled' AND p.status = N'success'
-            """,
-            account_id,
-        ).fetchall()
-        return {int(row[0]) for row in rows}
-
-
 async def finalize_push_logs(run_ref: str, success: bool, error: str | None = None) -> None:
     await _run(_finalize_push_logs, run_ref, success, error)
 
