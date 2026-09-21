@@ -21,6 +21,7 @@ logger = logging.getLogger("feishu_scheduler")
 MIN_INTERVAL_MINUTES = 5
 MAX_INTERVAL_MINUTES = 7 * 24 * 60
 PREVIOUS_QUERY_PROMPT = "__previous_business_query__"
+WEEKDAY_NAMES = "一二三四五六日"
 
 
 def parse_schedule_command(text: str) -> dict[str, str] | None:
@@ -118,6 +119,31 @@ def parse_schedule_command(text: str) -> dict[str, str] | None:
         "",
         text,
     )
+
+    weekly = re.match(
+        r"^每(?:个)?(?:周|星期|礼拜)\s*([一二三四五六日天1-7])\s*(.+)$",
+        schedule_text,
+        re.S,
+    )
+    if weekly:
+        day = weekly.group(1)
+        weekly_day = 6 if day == "天" else int(day) - 1 if day.isdigit() else WEEKDAY_NAMES.index(day)
+        try:
+            weekly_plan = parse_natural_daily_command("每天 " + weekly.group(2))
+        except ValueError:
+            return invalid_time_command("时间无效，请使用 00:00 到 23:59，例如每周五 17:30。")
+        if weekly_plan and len(weekly_plan[0]) == 1:
+            prompt, inline_name = extract_inline_task_name(weekly_plan[1])
+            command = {
+                "schedule_type": "weekly", "weekly_day": str(weekly_day),
+                "daily_time": weekly_plan[0][0], "prompt": prompt,
+            }
+            if explicit_name or inline_name:
+                command["task_name"] = explicit_name or inline_name
+            if explicit_mode:
+                command["execution_mode"] = explicit_mode
+            return command
+        return invalid_time_command("请提供每周执行的一个具体时间，例如每周五 17:30。")
 
     try:
         daily_plan = parse_natural_daily_command(schedule_text)
@@ -289,7 +315,14 @@ async def resolve_schedule_command(
             text,
             original_request=original_request or None,
         )
-        return schedule_plan_to_command(plan)
+        planned = schedule_plan_to_command(plan)
+        if command and command.get("schedule_type") == "weekly" and any(
+            planned.get(key) != command.get(key)
+            for key in ("schedule_type", "weekly_day", "daily_time")
+        ):
+            logger.warning("Weekly schedule model disagreed with explicit time; using parsed command")
+            return command
+        return planned
     except SchedulePlanError as exc:
         if command and command.get("schedule_type") != "help":
             logger.warning("Schedule planning failed; using deterministic command: %s", exc)
@@ -336,6 +369,11 @@ def schedule_plan_to_command(plan: SchedulePlan) -> dict[str, str]:
         if plan.schedule_type == "daily":
             if not plan.daily_time:
                 raise ValueError
+            command["daily_time"] = normalize_time(plan.daily_time.replace("：", ":"))
+        elif plan.schedule_type == "weekly":
+            if plan.weekly_day is None or not 0 <= plan.weekly_day <= 6 or not plan.daily_time:
+                raise ValueError
+            command["weekly_day"] = str(plan.weekly_day)
             command["daily_time"] = normalize_time(plan.daily_time.replace("：", ":"))
         elif plan.schedule_type == "daily_multi":
             if not plan.daily_times:
@@ -460,7 +498,7 @@ def is_schedule_creation_intent(text: str) -> bool:
         "定时任务" in text and any(marker in text for marker in creation_markers)
     ) or ("提醒" in text and any(marker in text for marker in creation_markers)) or (
         "每天" in text and any(marker in text for marker in ("推送", "提醒", "通知", "发送"))
-    )
+    ) or bool(re.search(r"每(?:个)?(?:周|星期|礼拜)\s*[一二三四五六日天1-7]", text))
 
 
 def looks_like_email_schedule(text: str) -> bool:
@@ -538,6 +576,7 @@ def schedule_help_text() -> str:
         "- 每天 09:00 分析最近 48 小时的邮件\n"
         "- 每天 09:30 和 17:20 分析未处理邮件并私聊推送\n"
         "- 每天晚上 9 点分析最近 7 天发件人为xxx的邮件\n"
+        "- 每周五 17:30 分析最近 48 小时的邮件\n"
         "- 每隔 2 小时分析前 5 封高优先级邮件\n\n"
         "可动态指定：时间范围、邮件数量、发件人、主题、正文关键词、"
         "收件人、抄送和重要程度。\n\n"
@@ -696,6 +735,8 @@ async def create_scheduled_task(app: TenantApp, event: dict[str, Any], command: 
     next_run_at = command.get("run_at")
     if command["schedule_type"] == "daily":
         next_run_at = scheduler_runtime.next_daily_run(command["daily_time"])
+    elif command["schedule_type"] == "weekly":
+        next_run_at = scheduler_runtime.next_weekly_run(int(command["weekly_day"]), command["daily_time"])
     elif command["schedule_type"] == "interval":
         next_run_at = scheduler_runtime.next_interval_run(
             int(command["interval_minutes"])
@@ -706,9 +747,9 @@ async def create_scheduled_task(app: TenantApp, event: dict[str, Any], command: 
             """
             INSERT INTO scheduled_task (
               task_name, tenant_key, app_id, bot_code, chat_id, chat_type, open_id,
-              schedule_type, run_at, daily_time, interval_minutes, prompt, next_run_at,
+              schedule_type, run_at, daily_time, weekly_day, interval_minutes, prompt, next_run_at,
               execution_mode, timeout_seconds, max_retries, timezone, last_status
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'idle')
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'idle')
             """,
             (
                 task_name,
@@ -721,6 +762,7 @@ async def create_scheduled_task(app: TenantApp, event: dict[str, Any], command: 
                 command["schedule_type"],
                 command.get("run_at"),
                 command.get("daily_time"),
+                command.get("weekly_day"),
                 command.get("interval_minutes"),
                 prompt,
                 next_run_at,
@@ -734,6 +776,8 @@ async def create_scheduled_task(app: TenantApp, event: dict[str, Any], command: 
     mode_label = "自动执行 Agent 查询" if execution_mode == "agent" else "发送提醒"
     if command["schedule_type"] == "daily":
         schedule = f"每天 {command['daily_time']}"
+    elif command["schedule_type"] == "weekly":
+        schedule = f"每周{WEEKDAY_NAMES[int(command['weekly_day'])]} {command['daily_time']}"
     elif command["schedule_type"] == "interval":
         schedule = interval_schedule_text(int(command["interval_minutes"]))
     else:
@@ -742,12 +786,8 @@ async def create_scheduled_task(app: TenantApp, event: dict[str, Any], command: 
         f"已创建定时任务 #{task_id}\n"
         f"- 任务名称：{task_name}\n"
         f"- 执行时间：{schedule}\n"
-        f"- 时区：{scheduler_runtime.DEFAULT_TIMEZONE}\n"
-        f"- 执行模式：{mode_label}\n"
         f"- 任务内容：{prompt}\n"
-        f"- 下次执行：{scheduler_runtime.display_datetime(next_run_at)}\n"
-        f"- 超时：{settings.scheduler_task_timeout_seconds} 秒\n"
-        f"- 失败重试：最多 {settings.scheduler_max_retries} 次"
+        f"- 下次执行：{scheduler_runtime.display_datetime(next_run_at)}"
     )
 
 
@@ -779,7 +819,7 @@ async def list_scheduled_tasks(
 
     rows = await fetch_all(
         """
-        SELECT id, task_name, schedule_type, run_at, daily_time, interval_minutes,
+        SELECT id, task_name, schedule_type, run_at, daily_time, weekly_day, interval_minutes,
                prompt, next_run_at,
                execution_mode, last_status, consecutive_failures
         FROM scheduled_task
@@ -798,6 +838,8 @@ async def list_scheduled_tasks(
     for row in rows:
         if row["schedule_type"] == "daily":
             schedule = f"每天 {row['daily_time']}"
+        elif row["schedule_type"] == "weekly":
+            schedule = f"每周{WEEKDAY_NAMES[int(row['weekly_day'])]} {row['daily_time']}"
         elif row["schedule_type"] == "interval":
             schedule = interval_schedule_text(int(row["interval_minutes"]))
         else:
@@ -863,6 +905,8 @@ async def manage_scheduled_task(
         next_run_at = task["run_at"]
         if task["schedule_type"] == "daily":
             next_run_at = scheduler_runtime.next_daily_run(task["daily_time"])
+        elif task["schedule_type"] == "weekly":
+            next_run_at = scheduler_runtime.next_weekly_run(int(task["weekly_day"]), task["daily_time"])
         elif task["schedule_type"] == "interval":
             next_run_at = scheduler_runtime.next_interval_run(
                 int(task["interval_minutes"])

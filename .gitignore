@@ -4,6 +4,7 @@ config/*.local.json
 __pycache__/
 *.py[cod]
 .venv/
+.idea/
 *.log
 *.out
 *.err

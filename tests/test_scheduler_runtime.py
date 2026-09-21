@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -19,7 +20,7 @@ from app.scheduler import (
     manage_scheduled_task,
     scheduled_task_history,
 )
-from app.scheduler_runtime import run_due_tasks
+from app.scheduler_runtime import next_weekly_run, run_due_tasks
 from app.memory.repository import add_conversation_turn
 from app.settings import get_settings
 
@@ -37,6 +38,14 @@ def tenant_app() -> TenantApp:
 
 
 class SchedulerRuntimeTests(unittest.IsolatedAsyncioTestCase):
+    def test_next_weekly_run_respects_same_day_and_week_boundary(self) -> None:
+        with patch("app.scheduler_runtime.now_datetime", return_value=datetime(2026, 9, 18, 17, 29)):
+            self.assertEqual(next_weekly_run(4, "17:30"), "2026-09-18 17:30:00")
+        with patch("app.scheduler_runtime.now_datetime", return_value=datetime(2026, 9, 18, 17, 30)):
+            self.assertEqual(next_weekly_run(4, "17:30"), "2026-09-25 17:30:00")
+        with patch("app.scheduler_runtime.now_datetime", return_value=datetime(2026, 9, 20, 10, 0)):
+            self.assertEqual(next_weekly_run(0, "09:00"), "2026-09-21 09:00:00")
+
     async def asyncSetUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory(dir=Path.cwd())
         self.root = Path(self.temp_dir.name)
@@ -132,6 +141,32 @@ class SchedulerRuntimeTests(unittest.IsolatedAsyncioTestCase):
             (task["id"],),
         )
         self.assertEqual(queued, {"enabled": 1, "last_status": "queued"})
+
+    async def test_weekly_email_task_is_created_and_repeats(self) -> None:
+        event = {
+            "tenant_key": "tenant", "app_id": "app", "open_id": "user",
+            "chat_id": "chat", "chat_type": "p2p",
+        }
+        answer = await create_scheduled_task(
+            tenant_app(), event,
+            {"schedule_type": "weekly", "weekly_day": "4", "daily_time": "17:30", "prompt": "分析我的邮件"},
+        )
+        task = await fetch_one("SELECT * FROM scheduled_task")
+        self.assertIn("每周五 17:30", answer)
+        self.assertEqual(task["weekly_day"], 4)
+        self.assertEqual(task["execution_mode"], "agent")
+        self.assertEqual(task["next_run_at"], next_weekly_run(4, "17:30"))
+        self.assertIn("每周五 17:30", await list_scheduled_tasks(tenant_app(), event))
+
+        await execute("UPDATE scheduled_task SET next_run_at = '2000-01-01 00:00:00' WHERE id = ?", (task["id"],))
+        with (
+            patch("app.email_service.handle_email_command", AsyncMock(return_value=EmailCommandResult("完成"))),
+            patch("app.scheduler_runtime.send_card", AsyncMock(return_value="message-id")),
+        ):
+            await run_due_tasks({"app": tenant_app()})
+        task = await fetch_one("SELECT * FROM scheduled_task WHERE id = ?", (task["id"],))
+        self.assertEqual(task["enabled"], 1)
+        self.assertEqual(task["next_run_at"], next_weekly_run(4, "17:30"))
 
     async def test_cancel_all_only_affects_current_user_scope(self) -> None:
         own_first = await self.insert_due_task(execution_mode="agent")

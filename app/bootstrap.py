@@ -100,6 +100,7 @@ CREATE TABLE IF NOT EXISTS scheduled_task (
   schedule_type TEXT NOT NULL,
   run_at TEXT,
   daily_time TEXT,
+  weekly_day INTEGER,
   interval_minutes INTEGER,
   prompt TEXT NOT NULL,
   enabled INTEGER NOT NULL DEFAULT 1,
@@ -427,6 +428,7 @@ async def ensure_scheduler_columns(db) -> None:
         "chat_type": "TEXT",
         "task_name": "TEXT",
         "interval_minutes": "INTEGER",
+        "weekly_day": "INTEGER",
     }
     for column, definition in column_definitions.items():
         if column not in columns:

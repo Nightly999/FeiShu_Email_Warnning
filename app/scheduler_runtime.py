@@ -239,9 +239,11 @@ async def complete_task_run(run_id: str, output: str) -> None:
 
 async def mark_task_success(task: dict[str, Any], run_id: str) -> None:
     now = now_text()
-    if task["schedule_type"] in {"daily", "interval"}:
+    if task["schedule_type"] in {"daily", "weekly", "interval"}:
         if task["schedule_type"] == "daily":
             next_run_at = next_daily_run(task["daily_time"])
+        elif task["schedule_type"] == "weekly":
+            next_run_at = next_weekly_run(int(task["weekly_day"]), task["daily_time"])
         else:
             next_run_at = next_interval_run(int(task["interval_minutes"]))
         await execute(
@@ -354,6 +356,18 @@ def next_daily_run(daily_time: str) -> str:
     run_at = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
     if run_at <= now:
         run_at += timedelta(days=1)
+    return run_at.strftime(DB_DATETIME_FORMAT)
+
+
+def next_weekly_run(weekly_day: int, daily_time: str) -> str:
+    if not 0 <= weekly_day <= 6:
+        raise ValueError("weekly_day must be 0 to 6")
+    hour, minute = [int(part) for part in daily_time.split(":")]
+    now = now_datetime()
+    run_at = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    run_at += timedelta(days=(weekly_day - now.weekday()) % 7)
+    if run_at <= now:
+        run_at += timedelta(days=7)
     return run_at.strftime(DB_DATETIME_FORMAT)
 
 

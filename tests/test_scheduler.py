@@ -264,6 +264,49 @@ class AgentSchedulePlanningTests(unittest.IsolatedAsyncioTestCase):
             {"schedule_type": "list", "page": "1"},
         )
 
+    def test_weekly_email_schedule_fallback(self) -> None:
+        self.assertEqual(
+            parse_schedule_command("每周五下午五点半分析我的邮件"),
+            {
+                "schedule_type": "weekly",
+                "weekly_day": "4",
+                "daily_time": "17:30",
+                "prompt": "分析我的邮件",
+            },
+        )
+        self.assertEqual(
+            parse_schedule_command("每星期日 09:00 分析我的邮件")["weekly_day"],
+            "6",
+        )
+
+    async def test_model_weekly_email_schedule(self) -> None:
+        plan = SchedulePlan(
+            action="create",
+            schedule_type="weekly",
+            weekly_day=4,
+            daily_time="17:30",
+            prompt="分析我的邮件",
+            execution_mode="agent",
+        )
+        with patch(
+            "app.scheduler.plan_schedule_creation", AsyncMock(return_value=plan)
+        ) as planner:
+            command = await resolve_schedule_command("每星期五下午五点半分析我的邮件")
+        self.assertEqual(command["schedule_type"], "weekly")
+        self.assertEqual(command["weekly_day"], "4")
+        self.assertEqual(command["daily_time"], "17:30")
+        planner.assert_awaited_once()
+
+    async def test_weekly_time_is_not_changed_by_model(self) -> None:
+        plan = SchedulePlan(
+            action="create", schedule_type="daily", daily_time="17:30",
+            prompt="分析我的邮件", execution_mode="agent",
+        )
+        with patch("app.scheduler.plan_schedule_creation", AsyncMock(return_value=plan)):
+            command = await resolve_schedule_command("每周五下午五点半分析我的邮件")
+        self.assertEqual(command["schedule_type"], "weekly")
+        self.assertEqual(command["weekly_day"], "4")
+
     async def test_unrecognized_schedule_language_uses_model_plan(self) -> None:
         plan = SchedulePlan(action="list", page=2)
         with patch(

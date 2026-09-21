@@ -16,6 +16,7 @@ from app.email_service import (
     EmailAnalysis,
     EmailPlan,
     _fallback_plan,
+    _likely_needs_reply,
     _select_messages,
     _validated_plan,
     analyze_pending,
@@ -115,6 +116,9 @@ def test_email_fallback_plan_applies_scope_and_bounds() -> None:
     assert hourly.lookback_hours == 12
     assert hourly.limit == 5
     assert hourly.only_unprocessed is True
+
+    reply_needed = _fallback_plan("告诉我哪些邮件我没有回复", settings)
+    assert reply_needed.reply_needed_only is True
 
     history = _fallback_plan("帮我分析历史邮件前80份", settings)
     assert history.lookback_hours == 24 * 365 * 10
@@ -444,6 +448,46 @@ def test_email_report_card_is_an_ai_briefing_without_table() -> None:
     assert "分析结果" in content
     assert "确认报价并回复" in content
     assert "逾期可能影响交付" in content
+
+
+def test_reply_needed_report_is_clearly_a_pop3_suggestion() -> None:
+    plan = EmailPlan(action="query", reply_needed_only=True)
+    card = build_email_report_card(
+        {"email_address": "user@example.com"},
+        [],
+        plan,
+    )
+
+    assert card["header"]["title"]["content"] == "待回复邮件建议"
+    content = "\n".join(
+        item.get("content", "") for item in card["body"]["elements"]
+    )
+    assert "疑似需要你回复" in content
+    assert "POP3 无法读取已发送邮件" in content
+
+
+def test_reply_needed_filter_requires_an_action_and_excludes_no_reply() -> None:
+    assert _likely_needs_reply(
+        {
+            "requires_attention": True,
+            "sender_address": "supplier@example.com",
+            "todos_json": '["确认报价并回复"]',
+        }
+    )
+    assert not _likely_needs_reply(
+        {
+            "requires_attention": True,
+            "sender_address": "no-reply@example.com",
+            "todos_json": '["查看通知"]',
+        }
+    )
+    assert not _likely_needs_reply(
+        {
+            "requires_attention": True,
+            "sender_address": "supplier@example.com",
+            "todos_json": "[]",
+        }
+    )
 
 
 def test_history_report_card_states_when_details_are_truncated() -> None:

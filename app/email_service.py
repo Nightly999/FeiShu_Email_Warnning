@@ -54,6 +54,7 @@ class EmailPlan(BaseModel):
     lookback_hours: int = Field(default=48, ge=1, le=HISTORICAL_LOOKBACK_HOURS)
     scope: Literal["all", "to", "cc", "mentioned"] = "all"
     important_only: bool = False
+    reply_needed_only: bool = False
     limit: int = Field(default=20, ge=1, le=MAX_EMAIL_QUERY_MESSAGES)
     sender_contains: str | None = Field(default=None, max_length=200)
     subject_contains: str | None = Field(default=None, max_length=200)
@@ -164,6 +165,8 @@ async def plan_email_request(text: str) -> EmailPlan:
         f"lookback_hours 设为 {HISTORICAL_LOOKBACK_HOURS}；指定发件人、主题、正文关键词时分别填写"
         " sender_contains、subject_contains、keywords；‘第1封/第3封’按从新到旧写入"
         " message_positions；‘未读/未处理/新邮件’设置 only_unprocessed=true。"
+        "用户询问‘哪些邮件没回复/需要我回复/待回复邮件’时设置 reply_needed_only=true；"
+        "这表示按邮件内容推测需要回复，不代表已经核验已发送邮件。"
         "不要补充用户没有提出的筛选条件。当前北京时间："
         + datetime.now(timezone(timedelta(hours=8))).isoformat(timespec="minutes")
         + "\n用户请求："
@@ -269,6 +272,18 @@ def _explicit_query_controls(text: str) -> dict[str, Any]:
         controls["message_positions"] = positions[:20]
     if any(word in text for word in ("未读", "未处理", "新邮件")):
         controls["only_unprocessed"] = True
+    if any(
+        phrase in text
+        for phrase in (
+            "没有回复",
+            "没回复",
+            "未回复",
+            "需要我回复",
+            "需要回复",
+            "待回复",
+        )
+    ):
+        controls["reply_needed_only"] = True
     return controls
 
 
@@ -375,6 +390,8 @@ async def sync_analyze_report(
         )
     if plan.important_only:
         selected = [item for item in selected if item.get("importance") == "高"]
+    if plan.reply_needed_only:
+        selected = [item for item in selected if _likely_needs_reply(item)]
     selected = selected[: plan.limit]
     answer = build_email_report(account, selected, plan)
     card = build_email_report_card(account, selected, plan)
@@ -503,6 +520,12 @@ async def _analyze_batch(
 
 def build_email_report(account: dict[str, Any], messages: list[dict[str, Any]], plan: EmailPlan) -> str:
     if not messages:
+        if plan.reply_needed_only:
+            return (
+                f"**邮箱**：{_mask_email(account['email_address'])}\n\n"
+                f"最近 {plan.lookback_hours} 小时没有发现疑似需要你回复的邮件。\n\n"
+                "说明：POP3 无法读取已发送邮件，本结果仅根据收件内容判断。"
+            )
         return (
             f"**邮箱**：{_mask_email(account['email_address'])}\n\n"
             f"最近 {plan.lookback_hours} 小时没有符合条件且可展示的邮件。"
@@ -512,11 +535,13 @@ def build_email_report(account: dict[str, Any], messages: list[dict[str, Any]], 
     cc_count = sum(item.get("relation_type") == "Cc" for item in messages)
     mentioned_count = sum(item.get("relation_type") == "正文提及" for item in messages)
     parts = [
-        "**邮件分析概览**",
+        "**待回复建议**" if plan.reply_needed_only else "**邮件分析概览**",
         f"- 邮箱：{_mask_email(account['email_address'])}",
         f"- 时间范围：最近 {plan.lookback_hours} 小时",
         f"- 邮件数：{len(messages)}（高重要 {high}，To {to_count}，Cc {cc_count}，正文提及 {mentioned_count}）",
     ]
+    if plan.reply_needed_only:
+        parts.append("- 说明：POP3 无法读取已发送邮件，以下仅为可能需要回复的邮件。")
     for index, item in enumerate(messages, 1):
         todos = _json_list(item.get("todos_json"))
         risks = _json_list(item.get("risks_json"))
@@ -546,12 +571,18 @@ def build_email_report_card(
         else f"最近 {plan.lookback_hours} 小时"
     )
     if not messages:
+        empty_text = (
+            "没有发现疑似需要你回复的邮件。\n\n"
+            "<font color=\"grey\">POP3 无法读取已发送邮件，本结果仅根据收件内容判断。</font>"
+            if plan.reply_needed_only
+            else "没有发现符合当前筛选条件的邮件。"
+        )
         elements = [
             {
                 "tag": "markdown",
                 "content": (
                     f"**{masked_email}** · {range_label}\n\n"
-                    "没有发现符合当前筛选条件的邮件。"
+                    f"{empty_text}"
                 ),
             }
         ]
@@ -569,6 +600,17 @@ def build_email_report_card(
             },
             {"tag": "hr"},
         ]
+        if plan.reply_needed_only:
+            elements.insert(
+                1,
+                {
+                    "tag": "markdown",
+                    "content": (
+                        "<font color=\"grey\">POP3 无法读取已发送邮件，"
+                        "以下仅为根据收件内容判断的待回复建议。</font>"
+                    ),
+                },
+            )
         for index, item in enumerate(messages[:CARD_EMAIL_DETAIL_LIMIT], 1):
             importance = item.get("importance") or "未分析"
             icon = {"高": "🔴", "中": "🟠", "低": "🟢"}.get(importance, "⚪")
@@ -622,7 +664,10 @@ def build_email_report_card(
         },
         "header": {
             "template": "blue",
-            "title": {"tag": "plain_text", "content": "邮件分析简报"},
+            "title": {
+                "tag": "plain_text",
+                "content": "待回复邮件建议" if plan.reply_needed_only else "邮件分析简报",
+            },
         },
         "body": {"elements": elements[:24]},
     }
@@ -807,6 +852,15 @@ def _select_messages(
     return selected[: plan.limit]
 
 
+def _likely_needs_reply(message: dict[str, Any]) -> bool:
+    if not message.get("requires_attention"):
+        return False
+    sender = str(message.get("sender_address") or "").casefold()
+    if any(value in sender for value in ("no-reply", "noreply", "do-not-reply")):
+        return False
+    return bool(_json_list(message.get("todos_json")))
+
+
 def _relation(message: dict[str, Any], email_address: str, display_name: str) -> str:
     to = json.loads(message.get("to_json") or "[]")
     cc = json.loads(message.get("cc_json") or "[]")
@@ -853,3 +907,4 @@ def _safe_error(exc: Exception) -> str:
     if isinstance(exc, ValidationError):
         return "模型结构化结果校验失败"
     return type(exc).__name__
+2
