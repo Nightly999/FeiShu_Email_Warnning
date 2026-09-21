@@ -274,6 +274,21 @@ async def list_recent_messages(account_id: int, lookback_hours: int, limit: int 
     return await _run(_list_recent_messages, account_id, lookback_hours, limit)
 
 
+async def count_recent_messages(account_id: int, lookback_hours: int) -> int:
+    return await _run(_count_recent_messages, account_id, lookback_hours)
+
+
+def _count_recent_messages(account_id: int, lookback_hours: int) -> int:
+    cutoff = datetime.utcnow() - timedelta(hours=max(1, lookback_hours))
+    with _open_connection() as connection:
+        row = connection.execute(
+            "SELECT COUNT(*) FROM asi.email_message WHERE email_account_id = ? AND sent_at >= ?",
+            account_id,
+            cutoff,
+        ).fetchone()
+        return int(row[0])
+
+
 def _list_recent_messages(account_id: int, lookback_hours: int, limit: int) -> list[dict[str, Any]]:
     cutoff = datetime.utcnow() - timedelta(hours=max(1, lookback_hours))
     with _open_connection() as connection:

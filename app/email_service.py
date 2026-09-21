@@ -18,11 +18,13 @@ from app.db import execute, fetch_one
 from app.email_pop3 import (
     EmailAuthenticationError,
     EmailConnectionError,
+    count_pop3_messages,
     fetch_recent_messages,
     verify_pop3_login,
 )
 from app.email_repository import (
     create_push_logs,
+    count_recent_messages,
     disable_email_account,
     get_email_account,
     known_uidls,
@@ -49,8 +51,9 @@ CARD_EMAIL_DETAIL_LIMIT = 20
 
 class EmailPlan(BaseModel):
     action: Literal[
-        "query", "bind", "rebind", "unbind", "status", "retention", "unrelated"
+        "query", "count", "bind", "rebind", "unbind", "status", "retention", "unrelated"
     ]
+    count_kind: Literal["all", "recent", "unread"] = "all"
     lookback_hours: int = Field(default=48, ge=1, le=HISTORICAL_LOOKBACK_HOURS)
     scope: Literal["all", "to", "cc", "mentioned"] = "all"
     important_only: bool = False
@@ -113,7 +116,7 @@ async def handle_email_command(event: dict[str, Any]) -> EmailCommandResult | No
             "邮箱数据暂时无法读取，请稍后重试或联系信息管理中心。", status="error"
         )
 
-    if plan.action in {"bind", "rebind"} or (plan.action == "query" and not account):
+    if plan.action in {"bind", "rebind"} or (plan.action in {"query", "count"} and not account):
         if event.get("_automation_run"):
             return EmailCommandResult("邮箱绑定已失效，请重新绑定。", status="denied")
         return await _binding_result(event, replacing=bool(account))
@@ -139,7 +142,43 @@ async def handle_email_command(event: dict[str, Any]) -> EmailCommandResult | No
         await update_retention(int(account["id"]), days)
         return EmailCommandResult(f"邮件正文和分析结果保留时间已设置为 {days} 天。")
 
+    if plan.action == "count":
+        return await _count_email_command(account, plan)
+    if "未读" in text:
+        return EmailCommandResult("当前邮箱使用 POP3，无法获取准确的已读/未读状态；‘未推送’不等于‘未读’。如需准确查询未读邮件，需要接入支持已读状态的邮箱接口。")
+
     return await sync_analyze_report(event, account, plan)
+
+
+async def _count_email_command(account: dict[str, Any], plan: EmailPlan) -> EmailCommandResult:
+    if plan.count_kind == "unread":
+        return EmailCommandResult("当前邮箱使用 POP3，无法获取准确的未读邮件数；‘未推送’不等于‘未读’。如需准确统计，需要接入支持已读状态的邮箱接口。")
+    if plan.count_kind == "recent":
+        try:
+            await sync_account(account, lookback_hours=plan.lookback_hours)
+            count = await count_recent_messages(int(account["id"]), plan.lookback_hours)
+        except EmailAuthenticationError:
+            return EmailCommandResult("邮箱账号或密码已失效，请重新绑定邮箱。", status="error")
+        except Exception:
+            logger.exception("Email count failed")
+            return EmailCommandResult("暂时无法统计已同步邮件，请稍后重试。", status="error")
+        return EmailCommandResult(f"最近 {plan.lookback_hours} 小时已同步、且有发送时间的邮件共 {count} 封（不含尚未同步的邮件）。")
+    settings = get_settings()
+    try:
+        count = await asyncio.to_thread(
+            count_pop3_messages,
+            host=account["pop3_host"],
+            port=int(account["pop3_port"]),
+            username=account["email_address"],
+            password=decrypt_email_password(account["password_ciphertext"]),
+            timeout=settings.email_pop3_timeout_seconds,
+        )
+    except EmailAuthenticationError:
+        return EmailCommandResult("邮箱账号或密码已失效，请重新绑定邮箱。", status="error")
+    except Exception:
+        logger.exception("POP3 mailbox count failed")
+        return EmailCommandResult("暂时无法统计收件箱邮件，请稍后重试。", status="error")
+    return EmailCommandResult(f"POP3 收件箱当前共有 {count} 封邮件（不含其他文件夹）。")
 
 
 async def plan_email_request(text: str) -> EmailPlan:
@@ -160,11 +199,13 @@ async def plan_email_request(text: str) -> EmailPlan:
         "解绑、绑定状态、保留时间或邮件查询分别选择对应 action；与邮箱无关必须选择 unrelated，"
         "例如‘查询生产进度’‘查询样品风险’都不是邮件请求。"
         "不要因为表达中没有‘邮箱’二字就判定无关，例如‘更换账号’‘重新登录’属于 rebind。"
-        "普通邮件查询选择 query。未说明时间时用 48 小时；今天按当天零点至今、本周按周一零点至今；"
+        "普通邮件分析选择 query。无额外筛选条件的邮件数量问题选择 count：邮箱总数用 count_kind=all，"
+        "指定时间范围的数量用 recent，未读数量用 unread（POP3 无法得知未读状态）。"
+        "未说明时间时用 48 小时；今天按当天零点至今、本周按周一零点至今；"
         "把用户要求的邮件数量写入 limit（最多100）；用户要求历史邮件但未指定日期时，"
         f"lookback_hours 设为 {HISTORICAL_LOOKBACK_HOURS}；指定发件人、主题、正文关键词时分别填写"
         " sender_contains、subject_contains、keywords；‘第1封/第3封’按从新到旧写入"
-        " message_positions；‘未读/未处理/新邮件’设置 only_unprocessed=true。"
+        " message_positions；‘未处理/新邮件’设置 only_unprocessed=true，未读绝不能等同于未处理。"
         "用户询问‘哪些邮件没回复/需要我回复/待回复邮件’时设置 reply_needed_only=true；"
         "这表示按邮件内容推测需要回复，不代表已经核验已发送邮件。"
         "不要补充用户没有提出的筛选条件。当前北京时间："
@@ -194,7 +235,7 @@ def _validated_plan(plan: EmailPlan, settings, text: str = "") -> EmailPlan:
             settings.email_min_retention_days,
             min(settings.email_max_retention_days, plan.retention_days),
         )
-    if plan.action == "query":
+    if plan.action in {"query", "count"}:
         plan = plan.model_copy(update=_explicit_query_controls(text))
     return plan
 
@@ -225,6 +266,7 @@ def _fallback_plan(text: str, settings) -> EmailPlan:
         return EmailPlan(action="retention", retention_days=days)
     if not looks_like_email_request(text):
         return EmailPlan(action="unrelated")
+    count_kind = _explicit_count_kind(text)
     hours = settings.email_initial_lookback_hours
     now = datetime.now(timezone(timedelta(hours=8)))
     if "今天" in text or "当天" in text:
@@ -239,11 +281,26 @@ def _fallback_plan(text: str, settings) -> EmailPlan:
     controls["lookback_hours"] = hours
     scope = "cc" if "抄送" in text else "to" if "收件人" in text else "mentioned" if "提到我" in text or "@我" in text else "all"
     return EmailPlan(
-        action="query",
+        action="count" if count_kind else "query",
+        count_kind=count_kind or "all",
         scope=scope,
         important_only="重要" in text or "紧急" in text,
         **controls,
     )
+
+
+def _explicit_count_kind(text: str) -> Literal["all", "recent", "unread"] | None:
+    if not re.search(r"(?:多少|几|总数|数量|统计|共计)", text):
+        return None
+    if not re.search(r"(?:封|邮件数|(?:多少|几).*邮件|收件箱.*(?:多少|几))", text):
+        return None
+    if "未读" in text:
+        return "unread"
+    if any(word in text for word in ("未处理", "重要", "紧急", "抄送", "待回复", "需要回复", "发件人", "来自")):
+        return None
+    if re.search(r"(?:最近|过去|今天|当天|本周|\d+\s*(?:天|小时))", text):
+        return "recent"
+    return "all"
 
 
 def _explicit_query_controls(text: str) -> dict[str, Any]:
@@ -270,7 +327,7 @@ def _explicit_query_controls(text: str) -> dict[str, Any]:
     positions = [int(value) for value in re.findall(r"第\s*(\d{1,2})\s*封", text)]
     if positions:
         controls["message_positions"] = positions[:20]
-    if any(word in text for word in ("未读", "未处理", "新邮件")):
+    if any(word in text for word in ("未处理", "新邮件")):
         controls["only_unprocessed"] = True
     if any(
         phrase in text

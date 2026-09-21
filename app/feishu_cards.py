@@ -177,14 +177,14 @@ def build_processing_card(question: str) -> dict[str, Any]:
         "config": {"wide_screen_mode": True, "update_multi": True},
         "header": {
             "template": "blue",
-            "title": {"tag": "plain_text", "content": "正在分析邮件..."},
+            "title": {"tag": "plain_text", "content": "正在处理您的请求..."},
         },
         "body": {
             "elements": [
                 {
                     "tag": "markdown",
                     "content": (
-                        "正在理解您的指令、同步并分析相关邮件，请稍候。\n\n"
+                        "正在理解您的指令，请稍候。\n\n"
                         f"**您的指令**：{escape_lark_md(trim_text(question, 500))}"
                     ),
                 }
@@ -241,7 +241,7 @@ def build_welcome_card() -> dict[str, Any]:
                 {
                     "tag": "markdown",
                     "content": (
-                        "💡 **示例**：分析最近两天的未读邮件\n"
+                        "💡 **示例**：分析最近两天的邮件\n"
                         "💡 **示例**：每天 9:30 和 17:20 分析未处理邮件并推送给我"
                     ),
                 },

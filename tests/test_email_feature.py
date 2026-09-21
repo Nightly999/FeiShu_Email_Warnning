@@ -10,7 +10,7 @@ import pytest
 from lark_oapi.ws.const import HEADER_SEQ, HEADER_SUM, HEADER_TYPE
 from lark_oapi.ws.pb.pbbp2_pb2 import Frame
 
-from app.email_pop3 import EmailAuthenticationError, parse_message
+from app.email_pop3 import EmailAuthenticationError, count_pop3_messages, parse_message
 from app.email_security import decrypt_email_password, encrypt_email_password
 from app.email_service import (
     EmailAnalysis,
@@ -39,6 +39,22 @@ from app.settings import get_settings
 
 def test_pop3_accepts_long_html_lines() -> None:
     assert poplib._MAXLINE == 10 * 1024 * 1024
+
+
+def test_pop3_mailbox_count_uses_stat_and_closes_connection(monkeypatch) -> None:
+    class Client:
+        closed = False
+
+        def stat(self):
+            return 237, 1024
+
+        def quit(self):
+            self.closed = True
+
+    client = Client()
+    monkeypatch.setattr("app.email_pop3._login", lambda *args: client)
+    assert count_pop3_messages(host="pop.example.com", port=995, username="user", password="secret", timeout=10) == 237
+    assert client.closed
 
 
 def test_email_password_is_authenticated_encrypted() -> None:
@@ -123,6 +139,7 @@ def test_email_fallback_plan_applies_scope_and_bounds() -> None:
     history = _fallback_plan("帮我分析历史邮件前80份", settings)
     assert history.lookback_hours == 24 * 365 * 10
     assert history.limit == 80
+    assert _fallback_plan("有多少封重要邮件", settings).action == "query"
 
 
 def test_explicit_email_login_skips_model_planning(
@@ -135,6 +152,65 @@ def test_explicit_email_login_skips_model_planning(
 
     assert plan.action == "rebind"
     model.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("question", "kind", "hours"),
+    [
+        ("邮箱里一共有多少封邮件", "all", 48),
+        ("邮箱里有多少邮件", "all", 48),
+        ("最近48小时有多少封邮件", "recent", 48),
+        ("这里一共有多少封未读邮件", "unread", 48),
+    ],
+)
+def test_count_questions_skip_model_planning(monkeypatch, question, kind, hours) -> None:
+    model = AsyncMock()
+    monkeypatch.setattr("app.email_service.invoke_chat_with_fallback", model)
+    plan = asyncio.run(plan_email_request(question))
+    assert plan.action == "count"
+    assert plan.count_kind == kind
+    assert plan.lookback_hours == hours
+    model.assert_not_awaited()
+
+
+def test_count_commands_do_not_analyze_or_truncate(monkeypatch) -> None:
+    account = {
+        "id": 12,
+        "email_address": "user@example.com",
+        "pop3_host": "pop.example.com",
+        "pop3_port": 995,
+        "password_ciphertext": "encrypted",
+    }
+    monkeypatch.setattr("app.email_service.get_email_account", AsyncMock(return_value=account))
+    monkeypatch.setattr("app.email_service.decrypt_email_password", lambda _: "password")
+
+    def mailbox_count(**_) -> int:
+        return 237
+
+    monkeypatch.setattr("app.email_service.count_pop3_messages", mailbox_count)
+    recent_count = AsyncMock(return_value=153)
+    monkeypatch.setattr("app.email_service.count_recent_messages", recent_count)
+    sync = AsyncMock(return_value=0)
+    monkeypatch.setattr("app.email_service.sync_account", sync)
+    analyze = AsyncMock()
+    monkeypatch.setattr("app.email_service.analyze_pending", analyze)
+    event = {"tenant_key": "tenant", "app_id": "app", "open_id": "user"}
+
+    total = asyncio.run(handle_email_command({**event, "text": "邮箱里一共有多少封邮件"}))
+    assert "237" in total.answer and "收件箱" in total.answer
+    assert total.card is None
+    sync.assert_not_awaited()
+
+    recent = asyncio.run(handle_email_command({**event, "text": "最近48小时有多少封邮件"}))
+    assert "153" in recent.answer and "已同步" in recent.answer
+    sync.assert_awaited_once()
+    recent_count.assert_awaited_once_with(12, 48)
+    analyze.assert_not_awaited()
+
+    unread = asyncio.run(handle_email_command({**event, "text": "有多少封未读邮件"}))
+    assert "无法" in unread.answer and "未读" in unread.answer and "POP3" in unread.answer
+    assert "153" not in unread.answer
+    analyze.assert_not_awaited()
 
 
 def test_model_recognizes_dynamic_email_account_command(

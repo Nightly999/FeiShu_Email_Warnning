@@ -53,6 +53,14 @@ def verify_pop3_login(host: str, port: int, username: str, password: str, timeou
         _quit(client)
 
 
+def count_pop3_messages(*, host: str, port: int, username: str, password: str, timeout: int) -> int:
+    client = _login(host, port, username, password, timeout)
+    try:
+        return client.stat()[0]
+    finally:
+        _quit(client)
+
+
 def fetch_recent_messages(
     *,
     host: str,
