@@ -8,6 +8,7 @@ from app.scheduler import (
     PREVIOUS_QUERY_PROMPT,
     auto_task_name,
     execution_mode_for_prompt,
+    handle_schedule_command,
     parse_schedule_command,
     recent_schedule_creation_request,
     resolve_schedule_command,
@@ -66,6 +67,26 @@ class ScheduleCommandTests(unittest.TestCase):
                 "prompt": "推送，处理未读邮件",
             },
         )
+
+    def test_short_morning_evening_email_schedule_is_parsed(self) -> None:
+        command = parse_schedule_command("每天早八点半和晚五点二十定时分析我的邮件")
+        self.assertEqual(command, {
+            "schedule_type": "daily_multi",
+            "daily_times": "08:30,17:20",
+            "prompt": "定时分析我的邮件",
+        })
+        self.assertEqual(execution_mode_for_prompt(command["prompt"]), "agent")
+
+    def test_minute_without_suffix_keeps_analyze_verb(self) -> None:
+        command = parse_schedule_command("每天早上八点半和晚上五点二十分析邮件")
+        self.assertEqual(command["daily_times"], "08:30,17:20")
+        self.assertEqual(command["prompt"], "分析邮件")
+        self.assertEqual(auto_task_name(command["prompt"], "agent"), "邮件分析")
+
+    def test_explicit_minute_suffix_keeps_analyze_verb(self) -> None:
+        command = parse_schedule_command("每天八点二十分分析邮件")
+        self.assertEqual(command["daily_time"], "08:20")
+        self.assertEqual(command["prompt"], "分析邮件")
 
     def test_natural_one_time_task_is_parsed(self) -> None:
         command = parse_schedule_command("在 2026-08-16 18:30 提醒我提交日报")
@@ -204,6 +225,85 @@ class ScheduleCommandTests(unittest.TestCase):
 
 
 class AgentSchedulePlanningTests(unittest.IsolatedAsyncioTestCase):
+    async def test_daily_email_deadlines_ask_for_exact_run_times(self) -> None:
+        text = "每天收到邮件早上八点前和晚上九点前分析我的邮件"
+        self.assertEqual(parse_schedule_command(text)["schedule_type"], "help")
+        with patch("app.scheduler.plan_schedule_creation", AsyncMock()) as planner:
+            command = await resolve_schedule_command(text)
+        self.assertEqual(command["schedule_type"], "invalid")
+        self.assertIn("具体执行时刻", command["error"])
+        planner.assert_not_awaited()
+
+    async def test_daily_email_schedule_with_action_before_times_reaches_planner(self) -> None:
+        text = "每天收到邮件早上八点和晚上九点分析我的邮件"
+        plan = SchedulePlan(
+            action="create", schedule_type="daily_multi",
+            daily_times=["08:00", "21:00"], prompt="分析我的邮件", execution_mode="agent",
+        )
+        with patch("app.scheduler.plan_schedule_creation", AsyncMock(return_value=plan)) as planner:
+            command = await resolve_schedule_command(text)
+        planner.assert_awaited_once()
+        self.assertEqual(command["daily_times"], "08:00,21:00")
+        self.assertEqual(command["execution_mode"], "agent")
+
+    async def test_email_about_daily_arrival_time_is_not_a_schedule(self) -> None:
+        with patch("app.scheduler.plan_schedule_creation", AsyncMock()) as planner:
+            command = await resolve_schedule_command("分析每天八点前收到的邮件")
+        self.assertIsNone(command)
+        planner.assert_not_awaited()
+
+    async def test_arrival_deadline_in_prompt_does_not_override_exact_schedule(self) -> None:
+        plan = SchedulePlan(
+            action="create", schedule_type="daily", daily_time="09:00",
+            prompt="分析八点前收到的邮件", execution_mode="agent",
+        )
+        with patch("app.scheduler.plan_schedule_creation", AsyncMock(return_value=plan)):
+            command = await resolve_schedule_command("每天 09:00 分析八点前收到的邮件")
+        self.assertEqual(command["schedule_type"], "daily")
+        self.assertEqual(command["daily_time"], "09:00")
+
+    async def test_short_morning_evening_email_command_creates_two_tasks(self) -> None:
+        text = "每天早八点半和晚五点二十定时分析我的邮件"
+        plan = SchedulePlan(
+            action="create", schedule_type="daily_multi",
+            daily_times=["08:30", "17:20"], prompt="分析我的邮件", execution_mode="agent",
+        )
+        with patch("app.scheduler.plan_schedule_creation", AsyncMock(return_value=plan)) as planner:
+            command = await resolve_schedule_command(text)
+        planner.assert_awaited_once()
+        with patch(
+            "app.scheduler.create_scheduled_task",
+            AsyncMock(side_effect=["已创建定时任务 #1", "已创建定时任务 #2"]),
+        ) as create:
+            answer = await handle_schedule_command(None, {}, command)
+        self.assertIn("#1", answer)
+        self.assertIn("#2", answer)
+        self.assertEqual([call.args[2]["daily_time"] for call in create.await_args_list], ["08:30", "17:20"])
+
+    async def test_explicit_daily_times_reject_model_disagreement(self) -> None:
+        plan = SchedulePlan(
+            action="create", schedule_type="daily_multi",
+            daily_times=["08:30", "19:20"], prompt="分析我的邮件", execution_mode="agent",
+        )
+        with patch("app.scheduler.plan_schedule_creation", AsyncMock(return_value=plan)):
+            command = await resolve_schedule_command("每天早八点半和晚五点二十定时分析我的邮件")
+        self.assertEqual(command["schedule_type"], "invalid")
+        self.assertIn("不一致", command["error"])
+
+    async def test_email_analysis_rejects_reminder_mode(self) -> None:
+        plan = SchedulePlan(
+            action="create", schedule_type="daily_multi",
+            daily_times=["08:30", "17:20"], prompt="分析我的邮件", execution_mode="reminder",
+        )
+        with patch("app.scheduler.plan_schedule_creation", AsyncMock(return_value=plan)):
+            command = await resolve_schedule_command("每天早八点半和晚五点二十定时分析我的邮件")
+        self.assertEqual(command["schedule_type"], "invalid")
+
+    async def test_explicit_daily_times_fallback_when_model_fails(self) -> None:
+        with patch("app.scheduler.plan_schedule_creation", AsyncMock(side_effect=SchedulePlanError("模型暂时不可用"))):
+            command = await resolve_schedule_command("每天早八点半和晚五点二十定时分析我的邮件")
+        self.assertEqual(command["daily_times"], "08:30,17:20")
+
     async def test_standalone_mode_reply_uses_recent_pending_schedule_request(
         self,
     ) -> None:
@@ -297,15 +397,15 @@ class AgentSchedulePlanningTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(command["daily_time"], "17:30")
         planner.assert_awaited_once()
 
-    async def test_weekly_time_is_not_changed_by_model(self) -> None:
+    async def test_weekly_time_conflict_is_rejected(self) -> None:
         plan = SchedulePlan(
             action="create", schedule_type="daily", daily_time="17:30",
             prompt="分析我的邮件", execution_mode="agent",
         )
         with patch("app.scheduler.plan_schedule_creation", AsyncMock(return_value=plan)):
             command = await resolve_schedule_command("每周五下午五点半分析我的邮件")
-        self.assertEqual(command["schedule_type"], "weekly")
-        self.assertEqual(command["weekly_day"], "4")
+        self.assertEqual(command["schedule_type"], "invalid")
+        self.assertIn("不一致", command["error"])
 
     async def test_unrecognized_schedule_language_uses_model_plan(self) -> None:
         plan = SchedulePlan(action="list", page=2)

@@ -4,6 +4,8 @@ import asyncio
 import base64
 import os
 import poplib
+from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock
 
 import pytest
@@ -55,6 +57,33 @@ def test_pop3_mailbox_count_uses_stat_and_closes_connection(monkeypatch) -> None
     monkeypatch.setattr("app.email_pop3._login", lambda *args: client)
     assert count_pop3_messages(host="pop.example.com", port=995, username="user", password="secret", timeout=10) == 237
     assert client.closed
+
+
+def test_pop3_fetches_only_selected_uidl(monkeypatch) -> None:
+    class Client:
+        retrieved = []
+        closed = False
+
+        def uidl(self):
+            return b"+OK", [b"1 other", b"2 wanted"], 0
+
+        def retr(self, number):
+            self.retrieved.append(number)
+            return b"+OK", [b"Subject: selected", b"", b"body"], 0
+
+        def quit(self):
+            self.closed = True
+
+    client = Client()
+    monkeypatch.setattr("app.email_pop3._login", lambda *_: client)
+    from app.email_pop3 import fetch_message_by_uidl
+
+    result = fetch_message_by_uidl(
+        host="pop.example.com", port=995, username="user", password="secret",
+        timeout=10, uidl="wanted", max_body_chars=1000,
+    )
+    assert result.subject == "selected"
+    assert client.retrieved == [2] and client.closed
 
 
 def test_email_password_is_authenticated_encrypted() -> None:
@@ -211,6 +240,132 @@ def test_count_commands_do_not_analyze_or_truncate(monkeypatch) -> None:
     assert "无法" in unread.answer and "未读" in unread.answer and "POP3" in unread.answer
     assert "153" not in unread.answer
     analyze.assert_not_awaited()
+
+
+def test_bound_email_status_shows_full_address_only_in_private_chat(monkeypatch) -> None:
+    account = {
+        "email_address": "shxm18@example.com",
+        "retention_days": 7,
+        "last_sync_at": "2026-09-22 09:00:00",
+    }
+    lookup = AsyncMock(return_value=account)
+    monkeypatch.setattr("app.email_service.get_email_account", lookup)
+    monkeypatch.setattr(
+        "app.email_service.plan_email_request",
+        AsyncMock(return_value=EmailPlan(action="status")),
+    )
+    event = {
+        "text": "我的邮箱账号是多少",
+        "tenant_key": "tenant",
+        "app_id": "app",
+        "open_id": "user",
+    }
+
+    private = asyncio.run(handle_email_command({**event, "chat_type": "p2p"}))
+    group = asyncio.run(handle_email_command({**event, "chat_type": "group"}))
+
+    assert "shxm18@example.com" in private.answer
+    assert "shxm18@example.com" not in group.answer
+    assert "私聊" in group.answer
+    lookup.assert_awaited_with("tenant", "app", "user")
+
+
+def test_one_week_ago_search_uses_one_calendar_day() -> None:
+    plan = _fallback_plan("查找一周前的某封邮件", get_settings())
+    target = (datetime.now(timezone(timedelta(hours=8))) - timedelta(days=7)).date().isoformat()
+    assert plan.action == "search"
+    assert (plan.date_start, plan.date_end) == (target, target)
+    assert plan.lookback_hours >= 8 * 24
+
+
+def test_search_filters_account_sender_and_subject_before_limit(monkeypatch) -> None:
+    from app.email_repository import _search_messages
+
+    calls = []
+
+    class Connection:
+        def execute(self, sql, *params):
+            calls.append((sql, params))
+            return type("Cursor", (), {"description": [("id",)], "fetchall": lambda self: [(42,)]})()
+
+    @contextmanager
+    def connection():
+        yield Connection()
+
+    monkeypatch.setattr("app.email_repository._open_connection", connection)
+    rows = _search_messages(7, datetime(2026, 9, 14), datetime(2026, 9, 16), "张三", "项目进度")
+
+    assert rows == [{"id": 42}]
+    sql, params = calls[0]
+    assert sql.index("WHERE m.email_account_id") < sql.index("ORDER BY")
+    assert sql.count("CHARINDEX") == 2
+    assert params[0] == 7 and params[-2:] == ("张三", "项目进度")
+
+
+def test_search_then_analyze_selected_message_is_account_scoped(monkeypatch) -> None:
+    account = {"id": 7, "email_address": "user@example.com", "retention_days": 14}
+    lookup = AsyncMock(return_value=account)
+    search = AsyncMock(return_value=[{
+        "id": 42, "sent_at": datetime(2026, 9, 15, 1, 0),
+        "sender_name": "张三", "subject": "项目进度",
+    }])
+    message = {"id": 42, "summary": "已分析", "subject": "项目进度"}
+    get_message = AsyncMock(return_value=message)
+    planner = AsyncMock(return_value=EmailPlan(
+        action="search", lookback_hours=216, date_start="2026-09-15",
+        date_end="2026-09-15", sender_contains="张三",
+    ))
+    monkeypatch.setattr("app.email_service.get_email_account", lookup)
+    monkeypatch.setattr("app.email_service.plan_email_request", planner)
+    monkeypatch.setattr("app.email_service.sync_account", AsyncMock())
+    monkeypatch.setattr("app.email_service.search_messages", search)
+    monkeypatch.setattr("app.email_service.get_message", get_message)
+    monkeypatch.setattr("app.email_service.analyze_pending", AsyncMock())
+    monkeypatch.setattr("app.email_service.create_push_logs", AsyncMock())
+    monkeypatch.setattr("app.email_service.build_email_report", lambda *_, **__: "分析结果")
+    monkeypatch.setattr("app.email_service.build_email_report_card", lambda *_, **__: {"body": {"elements": []}})
+    event = {"tenant_key": "tenant", "app_id": "app", "open_id": "user", "chat_id": "chat"}
+
+    found = asyncio.run(handle_email_command({**event, "text": "查找一周前张三的邮件"}))
+    selected = asyncio.run(handle_email_command({**event, "text": "分析邮件 #42"}))
+
+    assert "#42" in found.answer and "项目进度" in found.answer
+    assert selected.answer == "分析结果"
+    lookup.assert_awaited_with("tenant", "app", "user")
+    assert get_message.await_args_list[0].args == (7, 42)
+    assert planner.await_count == 1
+    assert search.await_args.args[3] == "张三"
+    assert "指定邮件" in build_email_report(account, [message], EmailPlan(action="query"), range_label="指定邮件")
+    assert "指定邮件" in build_email_report_card(account, [message], EmailPlan(action="query"), range_label="指定邮件")["body"]["elements"][0]["content"]
+
+
+def test_selected_old_email_reloads_body_without_storing_it(monkeypatch) -> None:
+    account = {
+        "id": 7, "email_address": "user@example.com", "retention_days": 7,
+        "pop3_host": "pop.example.com", "pop3_port": 995,
+        "password_ciphertext": "encrypted",
+    }
+    old = {"id": 42, "pop3_uidl": "wanted", "summary": None, "text_body": None, "html_body": None}
+    analyzed = {**old, "summary": "旧邮件分析结果"}
+    get_message = AsyncMock(side_effect=[old, analyzed])
+    load = AsyncMock()
+    monkeypatch.setattr("app.email_service.get_email_account", AsyncMock(return_value=account))
+    monkeypatch.setattr("app.email_service.get_message", get_message)
+    monkeypatch.setattr("app.email_service.decrypt_email_password", lambda _: "secret")
+    monkeypatch.setattr("app.email_service.fetch_message_by_uidl", lambda **_: type(
+        "Mail", (), {"to_record": lambda self: {"text_body": "原邮箱正文", "html_body": ""}}
+    )())
+    monkeypatch.setattr("app.email_service.analyze_pending", load)
+    monkeypatch.setattr("app.email_service.create_push_logs", AsyncMock())
+    monkeypatch.setattr("app.email_service.build_email_report", lambda *_, **__: "分析结果")
+    monkeypatch.setattr("app.email_service.build_email_report_card", lambda *_, **__: {"body": {"elements": []}})
+    event = {"tenant_key": "tenant", "app_id": "app", "open_id": "user", "chat_id": "chat", "text": "分析邮件 #42"}
+
+    result = asyncio.run(handle_email_command(event))
+
+    assert result.answer == "分析结果"
+    assert load.await_args.args[0][0]["text_body"] == "原邮箱正文"
+    assert get_message.await_args_list[0].args == (7, 42)
 
 
 def test_model_recognizes_dynamic_email_account_command(
@@ -717,7 +872,10 @@ def test_successful_card_binding_consumes_token_and_updates_card(monkeypatch: py
     consume.assert_awaited_once_with("token-1")
     sync.assert_awaited_once_with(account)
     assert "首次同步新增 3 封邮件" in update.await_args.args[2]["body"]["elements"][0]["content"]
-    send.assert_not_awaited()
+    assert update.await_args.args[2]["header"]["title"]["content"] == "登录成功"
+    send.assert_awaited_once()
+    assert send.await_args.args[2]["header"]["title"]["content"] == "功能使用介绍"
+    assert "邮箱已绑定" in str(send.await_args.args[2])
 
 
 def test_wrong_card_password_keeps_token_for_retry(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -748,6 +906,7 @@ def test_wrong_card_password_keeps_token_for_retry(monkeypatch: pytest.MonkeyPat
 
     consume.assert_not_awaited()
     assert "邮箱账号或密码错误" in send.await_args.args[2]["body"]["elements"][0]["content"]
+    send.assert_awaited_once()
 
 
 def test_password_fields_are_redacted_from_logs() -> None:

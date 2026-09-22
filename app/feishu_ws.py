@@ -58,7 +58,7 @@ from app.feishu import (
     send_card,
     update_card,
 )
-from app.feishu_cards import build_answer_card, build_processing_card, should_use_card
+from app.feishu_cards import build_answer_card, build_processing_card, build_welcome_card, should_use_card
 from app.files.service import register_uploaded_file
 from app.file_analysis import safe_resource_path
 from app.graph import run_agent
@@ -520,9 +520,10 @@ async def process_email_bind_card(app: TenantApp, action: dict[str, str]) -> Non
             message = "邮箱绑定成功，但首次同步失败；请稍后发送“分析我的邮件”重试。"
         else:
             message = f"邮箱绑定成功，首次同步新增 {count} 封邮件。"
-        card = build_answer_card("邮箱绑定", message)
+        card = build_answer_card("邮箱绑定", message, title="登录成功")
         if not await update_card(app, action["message_id"], card):
             await send_card(app, scope["chat_id"], card)
+        await send_card(app, scope["chat_id"], build_welcome_card(logged_in=True))
         return
 
     await send_card(

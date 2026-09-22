@@ -337,7 +337,10 @@ class WelcomeMessageTests(unittest.IsolatedAsyncioTestCase):
             "chat_id": "oc_chat",
             "open_id": "ou_example",
         }
-        with patch("app.welcome.send_card", new_callable=AsyncMock) as send_card:
+        with (
+            patch("app.welcome.get_email_account", new_callable=AsyncMock, return_value={"id": 1}),
+            patch("app.welcome.send_card", new_callable=AsyncMock) as send_card,
+        ):
             send_card.return_value = "om_welcome"
             self.assertTrue(await send_daily_welcome_once(app, event))
             self.assertFalse(await send_daily_welcome_once(app, event))
@@ -363,6 +366,30 @@ class WelcomeMessageTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(await send_daily_welcome_once(app, event))
 
         self.assertEqual(send_card.await_count, 2)
+
+    async def test_unbound_user_receives_login_card_on_chat_entry(self) -> None:
+        app = tenant_app()
+        event = {
+            "tenant_key": app.tenant_key,
+            "app_id": app.app_id,
+            "bot_code": app.bot_code,
+            "chat_id": "oc_new_chat",
+            "open_id": "ou_new_user",
+        }
+        with (
+            patch("app.welcome.get_settings") as settings,
+            patch("app.welcome.get_email_account", new_callable=AsyncMock, return_value=None),
+            patch("app.welcome.send_card", new_callable=AsyncMock, return_value="om_login") as send_card,
+        ):
+            settings.return_value.feishu_reply_enabled = True
+            settings.return_value.email_feature_enabled = True
+            self.assertTrue(await send_daily_welcome_once(app, event))
+            self.assertFalse(await send_daily_welcome_once(app, event))
+
+        self.assertEqual(send_card.await_count, 1)
+        card = send_card.await_args.args[2]
+        self.assertEqual(card["header"]["title"]["content"], "绑定公司邮箱")
+        self.assertEqual(card["body"]["elements"][1]["tag"], "form")
 
     def test_welcome_card_uses_interactive_card_format(self) -> None:
         card = build_welcome_card()

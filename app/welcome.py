@@ -5,6 +5,8 @@ from datetime import timezone
 from typing import Any
 
 from app.db import open_db
+from app.email_repository import get_email_account
+from app.email_service import _binding_result
 from app.feishu import TenantApp, send_card
 from app.feishu_cards import build_welcome_card
 from app.settings import get_settings
@@ -35,7 +37,17 @@ async def send_daily_welcome_once(app: TenantApp, event: dict[str, Any]) -> bool
         )
         return False
 
+    needs_login = False
+    if get_settings().email_feature_enabled:
+        try:
+            needs_login = await get_email_account(event["tenant_key"], event["app_id"], open_id) is None
+        except Exception:
+            logger.exception("Failed to check email binding on chat entry: bot_code=%s open_id=%s", app.bot_code, open_id)
+            return False
+
     delivery_date = datetime.now(WELCOME_TIMEZONE).date().isoformat()
+    if needs_login:
+        delivery_date += ":email_login"
     claim = (
         event["tenant_key"],
         event["app_id"],
@@ -67,7 +79,8 @@ async def send_daily_welcome_once(app: TenantApp, event: dict[str, Any]) -> bool
         return False
 
     try:
-        message_id = await send_card(app, chat_id, build_welcome_card())
+        card = (await _binding_result(event, replacing=False)).card if needs_login else build_welcome_card()
+        message_id = await send_card(app, chat_id, card)
         if not message_id:
             raise RuntimeError("Feishu welcome card send returned empty message_id")
     except Exception:

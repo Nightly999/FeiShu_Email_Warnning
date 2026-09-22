@@ -193,13 +193,13 @@ def build_processing_card(question: str) -> dict[str, Any]:
     }
 
 
-def build_welcome_card() -> dict[str, Any]:
+def build_welcome_card(*, logged_in: bool = False) -> dict[str, Any]:
     return {
         "schema": "2.0",
         "config": {"wide_screen_mode": True, "update_multi": True},
         "header": {
             "template": "green",
-            "title": {"tag": "plain_text", "content": "来邮速递｜AI 邮件助手 📬"},
+            "title": {"tag": "plain_text", "content": "功能使用介绍" if logged_in else "来邮速递｜AI 邮件助手 📬"},
         },
         "body": {
             "elements": [
@@ -214,6 +214,8 @@ def build_welcome_card() -> dict[str, Any]:
                 {
                     "tag": "markdown",
                     "content": (
+                        "**🔐 邮箱已绑定**\n现在可以直接查询和分析邮件。"
+                        if logged_in else
                         "**🔐 绑定邮箱**\n"
                         "- 首次发送“分析我的邮箱”，按卡片提示填写邮箱账号和密码\n"
                         "- 发送“重新绑定邮箱”可以覆盖原绑定"

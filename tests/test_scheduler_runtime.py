@@ -12,6 +12,7 @@ from app.bootstrap import bootstrap
 from app.db import execute, fetch_one
 from app.email_service import EmailCommandResult
 from app.feishu import TenantApp
+from app.feishu_cards import build_answer_card
 from app.scheduler import (
     PREVIOUS_QUERY_PROMPT,
     cancel_all_scheduled_tasks,
@@ -269,7 +270,25 @@ class SchedulerRuntimeTests(unittest.IsolatedAsyncioTestCase):
             "chat_id": "chat",
             "chat_type": "p2p",
         }
-        for number in range(1, 7):
+        for number in range(1, 4):
+            await create_scheduled_task(
+                tenant_app(),
+                event,
+                {
+                    "schedule_type": "daily",
+                    "daily_time": "09:00",
+                    "prompt": f"提醒我处理事项{number}",
+                },
+            )
+        three_tasks = await list_scheduled_tasks(tenant_app(), event)
+        self.assertEqual(len(three_tasks.splitlines()), 3)
+        self.assertTrue(all(line.startswith("#") and "每天 09:00" in line for line in three_tasks.splitlines()))
+        self.assertEqual(
+            len(build_answer_card("查看定时任务", three_tasks)["body"]["elements"][0]["content"].splitlines()),
+            3,
+        )
+
+        for number in range(4, 7):
             await create_scheduled_task(
                 tenant_app(),
                 event,
@@ -286,6 +305,13 @@ class SchedulerRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("下一页：查看定时任务 第2页", first_page)
         self.assertIn("第 2/2 页，共 6 个", second_page)
         self.assertIn("上一页：查看定时任务 第1页", second_page)
+        self.assertIn("每天 09:00", first_page)
+        self.assertNotIn("下次执行", first_page)
+        self.assertNotIn("[Agent/idle]", first_page)
+        self.assertFalse(any(
+            element["tag"] == "table"
+            for element in build_answer_card("查看定时任务", first_page)["body"]["elements"]
+        ))
 
         task = await fetch_one("SELECT id FROM scheduled_task ORDER BY id LIMIT 1")
         for number in range(1, 7):

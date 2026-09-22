@@ -8,7 +8,7 @@ import re
 import secrets
 import time
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, time as datetime_time, timedelta, timezone
 from typing import Any, Literal
 
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -19,6 +19,7 @@ from app.email_pop3 import (
     EmailAuthenticationError,
     EmailConnectionError,
     count_pop3_messages,
+    fetch_message_by_uidl,
     fetch_recent_messages,
     verify_pop3_login,
 )
@@ -26,12 +27,14 @@ from app.email_repository import (
     create_push_logs,
     count_recent_messages,
     disable_email_account,
+    get_message,
     get_email_account,
     known_uidls,
     list_recent_messages,
     mark_analysis_failed,
     save_analysis,
     save_messages,
+    search_messages,
     update_retention,
     update_sync_result,
     upsert_email_account,
@@ -47,11 +50,12 @@ EMAIL_WORDS = ("邮件", "邮箱", "收件箱", "抄送", "email", "mail")
 MAX_EMAIL_QUERY_MESSAGES = 9999
 HISTORICAL_LOOKBACK_HOURS = 24 * 365 * 10
 CARD_EMAIL_DETAIL_LIMIT = 20
+SEARCH_SYNC_MAX_MESSAGES = 500  # ponytail: bounded POP3 backfill; use a server-side search API for larger mailboxes.
 
 
 class EmailPlan(BaseModel):
     action: Literal[
-        "query", "count", "bind", "rebind", "unbind", "status", "retention", "unrelated"
+        "query", "search", "count", "bind", "rebind", "unbind", "status", "retention", "unrelated"
     ]
     count_kind: Literal["all", "recent", "unread"] = "all"
     lookback_hours: int = Field(default=48, ge=1, le=HISTORICAL_LOOKBACK_HOURS)
@@ -61,6 +65,8 @@ class EmailPlan(BaseModel):
     limit: int = Field(default=20, ge=1, le=MAX_EMAIL_QUERY_MESSAGES)
     sender_contains: str | None = Field(default=None, max_length=200)
     subject_contains: str | None = Field(default=None, max_length=200)
+    date_start: str | None = None
+    date_end: str | None = None
     keywords: list[str] = Field(default_factory=list, max_length=10)
     message_positions: list[int] = Field(default_factory=list, max_length=20)
     only_unprocessed: bool = False
@@ -104,7 +110,8 @@ async def handle_email_command(event: dict[str, Any]) -> EmailCommandResult | No
     if event.get("_automation_run") and not looks_like_email_request(text):
         return None
 
-    plan = await plan_email_request(text)
+    selected = re.fullmatch(r"\s*分析\s*邮件\s*#\s*(\d+)\s*", text)
+    plan = EmailPlan(action="query") if selected else await plan_email_request(text)
     if plan.action == "unrelated":
         return None
     scope = (event["tenant_key"], event["app_id"], event["open_id"])
@@ -123,8 +130,10 @@ async def handle_email_command(event: dict[str, Any]) -> EmailCommandResult | No
     if plan.action == "status":
         if not account:
             return EmailCommandResult("当前尚未绑定邮箱。")
+        if event.get("chat_type") != "p2p":
+            return EmailCommandResult("请在与机器人的私聊中查询完整邮箱账号。")
         return EmailCommandResult(
-            f"当前已绑定邮箱：{_mask_email(account['email_address'])}\n"
+            f"当前已绑定邮箱：{account['email_address']}\n"
             f"数据保留：{account['retention_days']} 天\n"
             f"最近同步：{account.get('last_sync_at') or '尚未同步'}"
         )
@@ -144,6 +153,10 @@ async def handle_email_command(event: dict[str, Any]) -> EmailCommandResult | No
 
     if plan.action == "count":
         return await _count_email_command(account, plan)
+    if selected:
+        return await _analyze_selected_email(event, account, int(selected.group(1)))
+    if plan.action == "search":
+        return await _search_email_command(account, plan)
     if "未读" in text:
         return EmailCommandResult("当前邮箱使用 POP3，无法获取准确的已读/未读状态；‘未推送’不等于‘未读’。如需准确查询未读邮件，需要接入支持已读状态的邮箱接口。")
 
@@ -181,10 +194,91 @@ async def _count_email_command(account: dict[str, Any], plan: EmailPlan) -> Emai
     return EmailCommandResult(f"POP3 收件箱当前共有 {count} 封邮件（不含其他文件夹）。")
 
 
+async def _search_email_command(account: dict[str, Any], plan: EmailPlan) -> EmailCommandResult:
+    try:
+        if plan.date_start:
+            start_day = date.fromisoformat(plan.date_start)
+            end_day = date.fromisoformat(plan.date_end or plan.date_start)
+            if end_day < start_day:
+                return EmailCommandResult("结束日期不能早于开始日期。", status="error")
+            china = timezone(timedelta(hours=8))
+            start = datetime.combine(start_day, datetime_time.min, china).astimezone(timezone.utc).replace(tzinfo=None)
+            end = datetime.combine(end_day + timedelta(days=1), datetime_time.min, china).astimezone(timezone.utc).replace(tzinfo=None)
+            lookback_hours = max(plan.lookback_hours, int((datetime.utcnow() - start).total_seconds() // 3600) + 2)
+        else:
+            lookback_hours = plan.lookback_hours
+            start = datetime.utcnow() - timedelta(hours=lookback_hours)
+            end = datetime.utcnow() + timedelta(seconds=1)
+        await sync_account(account, lookback_hours=lookback_hours, max_messages=SEARCH_SYNC_MAX_MESSAGES)
+        rows = await search_messages(
+            int(account["id"]), start, end, plan.sender_contains, plan.subject_contains,
+        )
+    except ValueError:
+        return EmailCommandResult("日期格式无效，请使用 YYYY-MM-DD。", status="error")
+    except EmailAuthenticationError:
+        return EmailCommandResult("邮箱账号或密码已失效，请重新绑定邮箱。", status="error")
+    except Exception:
+        logger.exception("Email search failed")
+        return EmailCommandResult("邮件查找失败，请稍后重试。", status="error")
+    if not rows:
+        return EmailCommandResult("没有找到符合条件的邮件。请确认日期、发件人或主题。")
+    lines = [f"候选邮件（显示前 {len(rows)} 封，最多 20 封）："]
+    for row in rows:
+        sent_at = row.get("sent_at")
+        when = (sent_at + timedelta(hours=8)).strftime("%m-%d %H:%M") if isinstance(sent_at, datetime) else "时间未知"
+        sender = str(row.get("sender_name") or row.get("sender_address") or "未知发件人").replace("\n", " ")[:30]
+        subject = str(row.get("subject") or "无主题").replace("\n", " ")[:55]
+        lines.append(f"#{row['id']}  {when}  {sender}  {subject}")
+    lines.append("发送“分析邮件 #编号”可分析指定的一封。")
+    return EmailCommandResult("\n".join(lines))
+
+
+async def _analyze_selected_email(
+    event: dict[str, Any], account: dict[str, Any], message_id: int,
+) -> EmailCommandResult:
+    message = await get_message(int(account["id"]), message_id)
+    if not message:
+        return EmailCommandResult("没有找到这封邮件，或它不属于当前绑定的邮箱。", status="error")
+    if not message.get("summary") and not (message.get("text_body") or message.get("html_body")):
+        settings = get_settings()
+        try:
+            restored = await asyncio.to_thread(
+                fetch_message_by_uidl,
+                host=account["pop3_host"], port=int(account["pop3_port"]),
+                username=account["email_address"],
+                password=decrypt_email_password(account["password_ciphertext"]),
+                timeout=settings.email_pop3_timeout_seconds,
+                uidl=message["pop3_uidl"], max_body_chars=settings.email_max_body_chars,
+            )
+        except EmailAuthenticationError:
+            return EmailCommandResult("邮箱账号或密码已失效，请重新绑定邮箱。", status="error")
+        except Exception:
+            logger.exception("Failed to reload selected email: message_id=%s", message_id)
+            return EmailCommandResult("旧邮件正文读取失败，请稍后重试。", status="error")
+        if not restored:
+            return EmailCommandResult("原邮箱已无这封邮件，无法重新读取正文进行分析。", status="error")
+        message.update(restored.to_record())
+    await analyze_pending(
+        [message], int(account["retention_days"]), account["email_address"],
+        await _display_name(event),
+    )
+    analyzed = await get_message(int(account["id"]), message_id)
+    if not analyzed or not analyzed.get("summary"):
+        return EmailCommandResult("邮件已找到，但模型分析暂时失败，请稍后重试。", status="error")
+    plan = EmailPlan(action="query", limit=1)
+    run_ref = str(event.get("message_id") or secrets.token_hex(12))
+    await create_push_logs([message_id], "manual", "", run_ref)
+    return EmailCommandResult(
+        build_email_report(account, [analyzed], plan, range_label="指定邮件"),
+        card=build_email_report_card(account, [analyzed], plan, range_label="指定邮件"),
+        run_ref=run_ref,
+    )
+
+
 async def plan_email_request(text: str) -> EmailPlan:
     settings = get_settings()
     explicit_plan = _fallback_plan(text, settings)
-    if explicit_plan.action not in {"query", "unrelated"}:
+    if explicit_plan.action not in {"query", "search", "unrelated"}:
         return explicit_plan
     tool = {
         "type": "function",
@@ -199,7 +293,9 @@ async def plan_email_request(text: str) -> EmailPlan:
         "解绑、绑定状态、保留时间或邮件查询分别选择对应 action；与邮箱无关必须选择 unrelated，"
         "例如‘查询生产进度’‘查询样品风险’都不是邮件请求。"
         "不要因为表达中没有‘邮箱’二字就判定无关，例如‘更换账号’‘重新登录’属于 rebind。"
-        "普通邮件分析选择 query。无额外筛选条件的邮件数量问题选择 count：邮箱总数用 count_kind=all，"
+        "普通邮件分析选择 query；只查找候选邮件而未要求分析时选择 search，返回候选编号供后续分析。"
+        "search 的‘一周前’指北京时间 7 天前的整天，date_start 和 date_end 都填该日 YYYY-MM-DD。"
+        "无额外筛选条件的邮件数量问题选择 count：邮箱总数用 count_kind=all，"
         "指定时间范围的数量用 recent，未读数量用 unread（POP3 无法得知未读状态）。"
         "未说明时间时用 48 小时；今天按当天零点至今、本周按周一零点至今；"
         "把用户要求的邮件数量写入 limit（最多100）；用户要求历史邮件但未指定日期时，"
@@ -235,7 +331,9 @@ def _validated_plan(plan: EmailPlan, settings, text: str = "") -> EmailPlan:
             settings.email_min_retention_days,
             min(settings.email_max_retention_days, plan.retention_days),
         )
-    if plan.action in {"query", "count"}:
+    if _fallback_plan(text, settings).action == "search" and plan.action in {"query", "unrelated"}:
+        plan.action = "search"
+    if plan.action in {"query", "search", "count"}:
         plan = plan.model_copy(update=_explicit_query_controls(text))
     return plan
 
@@ -280,8 +378,12 @@ def _fallback_plan(text: str, settings) -> EmailPlan:
     hours = int(controls.get("lookback_hours", hours))
     controls["lookback_hours"] = hours
     scope = "cc" if "抄送" in text else "to" if "收件人" in text else "mentioned" if "提到我" in text or "@我" in text else "all"
+    search_only = "分析" not in text and (
+        any(word in text for word in ("查找", "搜索", "找出"))
+        or ("查询" in text and any(word in text for word in ("某封", "一周前", "天前", "主题")))
+    )
     return EmailPlan(
-        action="count" if count_kind else "query",
+        action="count" if count_kind else "search" if search_only else "query",
         count_kind=count_kind or "all",
         scope=scope,
         important_only="重要" in text or "紧急" in text,
@@ -305,10 +407,18 @@ def _explicit_count_kind(text: str) -> Literal["all", "recent", "unread"] | None
 
 def _explicit_query_controls(text: str) -> dict[str, Any]:
     controls: dict[str, Any] = {}
+    days_ago = 7 if "一周前" in text else None
+    day_ago_match = re.search(r"(\d{1,2})\s*天前", text)
+    if day_ago_match:
+        days_ago = int(day_ago_match.group(1))
+    if days_ago is not None:
+        target = datetime.now(timezone(timedelta(hours=8))).date() - timedelta(days=days_ago)
+        controls.update(date_start=target.isoformat(), date_end=target.isoformat())
+        controls["lookback_hours"] = min(HISTORICAL_LOOKBACK_HOURS, (days_ago + 2) * 24)
     if "历史" in text:
         controls["lookback_hours"] = HISTORICAL_LOOKBACK_HOURS
     day_match = re.search(r"(?:最近|过去)?\s*(\d{1,2})\s*天", text)
-    if day_match:
+    if day_match and days_ago is None:
         controls["lookback_hours"] = min(
             HISTORICAL_LOOKBACK_HOURS, int(day_match.group(1)) * 24
         )
@@ -392,7 +502,7 @@ async def sync_account(account: dict[str, Any], *, lookback_hours: int, max_mess
             password=decrypt_email_password(account["password_ciphertext"]),
             timeout=settings.email_pop3_timeout_seconds,
             lookback_hours=min(HISTORICAL_LOOKBACK_HOURS, max(1, lookback_hours)),
-            max_messages=min(100, max(1, max_messages)),
+            max_messages=min(SEARCH_SYNC_MAX_MESSAGES, max(1, max_messages)),
             max_body_chars=settings.email_max_body_chars,
             known_uidls=existing,
             stop_at_known=lookback_hours <= settings.email_initial_lookback_hours,
@@ -575,7 +685,10 @@ async def _analyze_batch(
     ]
 
 
-def build_email_report(account: dict[str, Any], messages: list[dict[str, Any]], plan: EmailPlan) -> str:
+def build_email_report(
+    account: dict[str, Any], messages: list[dict[str, Any]], plan: EmailPlan,
+    *, range_label: str | None = None,
+) -> str:
     if not messages:
         if plan.reply_needed_only:
             return (
@@ -594,7 +707,7 @@ def build_email_report(account: dict[str, Any], messages: list[dict[str, Any]], 
     parts = [
         "**待回复建议**" if plan.reply_needed_only else "**邮件分析概览**",
         f"- 邮箱：{_mask_email(account['email_address'])}",
-        f"- 时间范围：最近 {plan.lookback_hours} 小时",
+        f"- 时间范围：{range_label or f'最近 {plan.lookback_hours} 小时'}",
         f"- 邮件数：{len(messages)}（高重要 {high}，To {to_count}，Cc {cc_count}，正文提及 {mentioned_count}）",
     ]
     if plan.reply_needed_only:
@@ -619,10 +732,11 @@ def build_email_report(account: dict[str, Any], messages: list[dict[str, Any]], 
 
 
 def build_email_report_card(
-    account: dict[str, Any], messages: list[dict[str, Any]], plan: EmailPlan
+    account: dict[str, Any], messages: list[dict[str, Any]], plan: EmailPlan,
+    *, range_label: str | None = None,
 ) -> dict[str, Any]:
     masked_email = escape_lark_md(_mask_email(account["email_address"]))
-    range_label = (
+    range_label = range_label or (
         "历史邮件"
         if plan.lookback_hours >= HISTORICAL_LOOKBACK_HOURS
         else f"最近 {plan.lookback_hours} 小时"

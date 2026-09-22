@@ -234,10 +234,10 @@ def parse_natural_daily_command(text: str) -> tuple[list[str], str] | None:
         return None
     position = match.end()
     clock = re.compile(
-        r"(凌晨|清晨|早上|上午|中午|下午|晚上)?\s*"
+        r"(凌晨|清晨|早上|早|上午|中午|下午|晚上|晚)?\s*"
         r"([零〇一二两三四五六七八九十\d]{1,3})\s*"
         r"(?::\s*([零〇一二两三四五六七八九十\d]{1,3})|"
-        r"点\s*(?:(半)|([零〇一二两三四五六七八九十\d]{1,3})\s*分?)?)"
+        r"点\s*(?:(半)|([零〇一二两三四五六七八九十\d]{1,3})\s*(?:分(?!析))?)?)"
     )
     times: list[str] = []
     while True:
@@ -255,13 +255,13 @@ def parse_natural_daily_command(text: str) -> tuple[list[str], str] | None:
         if hour is None or minute is None:
             raise ValueError("invalid clock")
         period = clock_match.group(1) or ""
-        if period in {"下午", "晚上"} and 1 <= hour < 12:
+        if period in {"下午", "晚上", "晚"} and 1 <= hour < 12:
             hour += 12
         elif period == "中午" and 1 <= hour < 11:
             hour += 12
         elif period in {"凌晨", "清晨"} and hour == 12:
             hour = 0
-        elif period in {"早上", "上午"} and hour == 12:
+        elif period in {"早上", "早", "上午"} and hour == 12:
             hour = 0
         times.append(normalize_time(f"{hour}:{minute:02d}"))
         position = clock_match.end()
@@ -300,7 +300,7 @@ async def resolve_schedule_command(
         original_request = referenced_message_text
     should_plan = bool(
         is_schedule_creation_intent(text)
-        or (command and command.get("schedule_type") == "help")
+        or (command and command.get("schedule_type") in {"help", "once", "daily", "daily_multi", "weekly", "interval"})
         or (original_request and is_execution_mode_reply(text))
         or (
             command is None
@@ -309,6 +309,11 @@ async def resolve_schedule_command(
     )
     if not should_plan:
         return command
+    if re.search(r"(?:点(?:半|[零〇一二两三四五六七八九十两\d]{1,3}分?)?|[:：]\d{1,2})\s*之?前", text) and (
+        not command or command.get("schedule_type") == "help"
+        or str(command.get("prompt") or "").startswith(("前", "之前"))
+    ):
+        return invalid_time_command("“八点前”这类说法是截止时间；请明确具体执行时刻，或说明要提前多少分钟。")
 
     try:
         plan = await plan_schedule_creation(
@@ -316,12 +321,26 @@ async def resolve_schedule_command(
             original_request=original_request or None,
         )
         planned = schedule_plan_to_command(plan)
-        if command and command.get("schedule_type") == "weekly" and any(
-            planned.get(key) != command.get(key)
-            for key in ("schedule_type", "weekly_day", "daily_time")
-        ):
-            logger.warning("Weekly schedule model disagreed with explicit time; using parsed command")
-            return command
+        if command and planned.get("schedule_type") != "invalid":
+            if (
+                looks_like_email_schedule(command.get("prompt", ""))
+                and "分析" in command.get("prompt", "")
+                and planned.get("execution_mode") == "reminder"
+            ):
+                return invalid_time_command("邮件分析必须使用自动执行模式，模型识别为提醒模式，请重新确认。")
+            explicit_fields = {
+                "daily": ("daily_time",),
+                "daily_multi": ("daily_times",),
+                "weekly": ("weekly_day", "daily_time"),
+                "interval": ("interval_minutes",),
+                "once": ("run_at",) if re.search(r"\d{4}-\d{2}-\d{2}", text) else (),
+            }.get(command.get("schedule_type"))
+            if explicit_fields is not None and (
+                planned.get("schedule_type") != command["schedule_type"]
+                or any(planned.get(key) != command.get(key) for key in explicit_fields)
+            ):
+                logger.warning("Schedule model disagreed with explicit time; rejecting command")
+                return invalid_time_command("模型识别的执行时间与原指令不一致，请重新确认时间后再发送。")
         return planned
     except SchedulePlanError as exc:
         if command and command.get("schedule_type") != "help":
@@ -498,6 +517,9 @@ def is_schedule_creation_intent(text: str) -> bool:
         "定时任务" in text and any(marker in text for marker in creation_markers)
     ) or ("提醒" in text and any(marker in text for marker in creation_markers)) or (
         "每天" in text and any(marker in text for marker in ("推送", "提醒", "通知", "发送"))
+    ) or (
+        bool(re.match(r"^(?:请|帮我|请帮我|我想|希望)?\s*每天", text.strip()))
+        and any(word in text for word in ("分析", "查询", "汇总", "检查"))
     ) or bool(re.search(r"每(?:个)?(?:周|星期|礼拜)\s*[一二三四五六日天1-7]", text))
 
 
@@ -597,7 +619,7 @@ def auto_task_name(prompt: str, execution_mode: str) -> str:
         if name and not name.endswith("提醒"):
             name += "提醒"
     else:
-        name = re.sub(r"^(?:查询|获取|分析)", "", name).strip()
+        name = "邮件分析" if re.fullmatch(r"分析(?:我的)?邮件", name) else re.sub(r"^(?:查询|获取|分析)", "", name).strip()
         name = name.replace("并汇总", "汇总")
     name = name.strip(" ，,。；;：:") or (
         "定时提醒" if execution_mode == "reminder" else "定时业务查询"
@@ -819,9 +841,8 @@ async def list_scheduled_tasks(
 
     rows = await fetch_all(
         """
-        SELECT id, task_name, schedule_type, run_at, daily_time, weekly_day, interval_minutes,
-               prompt, next_run_at,
-               execution_mode, last_status, consecutive_failures
+        SELECT id, task_name, schedule_type, run_at, daily_time, weekly_day,
+               interval_minutes, last_status
         FROM scheduled_task
         WHERE tenant_key = ?
           AND app_id = ?
@@ -834,7 +855,7 @@ async def list_scheduled_tasks(
         (*scope, page_size, (page - 1) * page_size),
     )
 
-    lines = [f"当前定时任务（第 {page}/{total_pages} 页，共 {total} 个）："]
+    lines = [f"第 {page}/{total_pages} 页，共 {total} 个定时任务"] if total_pages > 1 else []
     for row in rows:
         if row["schedule_type"] == "daily":
             schedule = f"每天 {row['daily_time']}"
@@ -844,17 +865,9 @@ async def list_scheduled_tasks(
             schedule = interval_schedule_text(int(row["interval_minutes"]))
         else:
             schedule = scheduler_runtime.display_datetime(row["run_at"])
-        mode = "Agent" if row["execution_mode"] == "agent" else "提醒"
-        status = row["last_status"] or "idle"
-        failure = (
-            f"，连续失败 {row['consecutive_failures']} 次"
-            if row["consecutive_failures"]
-            else ""
-        )
         lines.append(
-            f"- #{row['id']} {row['task_name'] or '未命名任务'} [{mode}/{status}] "
-            f"{schedule}：{row['prompt']}"
-            f"（下次：{scheduler_runtime.display_datetime(row['next_run_at'])}{failure}）"
+            f"#{row['id']}  {schedule}  {row['task_name'] or '未命名任务'}"
+            f"{'（已暂停）' if row['last_status'] == 'paused' else ''}"
         )
     append_page_commands(
         lines,
@@ -862,7 +875,6 @@ async def list_scheduled_tasks(
         total_pages=total_pages,
         command=lambda target: f"查看定时任务 第{target}页",
     )
-    lines.append("\n发送“查看定时任务 #编号 运行记录”可查看执行历史。")
     return "\n".join(lines)
 
 

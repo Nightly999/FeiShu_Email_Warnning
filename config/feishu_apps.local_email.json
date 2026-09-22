@@ -1,9 +1,9 @@
 {
   "apps": {
     "asi-wip": {
-      "appId": "cli_aa2dd7ce3aba5bfb",
-      "appSecret": "dQRH3ysaSUTJm97ei9FcbbxacqPyBDiD",
-      "name": "来邮速递"
+      "appId": "cli_aa3b4f847e389be7",
+      "appSecret": "kxcxjKCO5Y7lw3i7CoKXEeusWMQrahpL",
+      "name": "ASI-来邮速递"
     },
     "asi-wip-weijie": {
       "appId": "cli_aa2d19c2f8381bd6",
@@ -11,39 +11,44 @@
       "name": "上海维杰服饰-来邮速递"
     },
     "asi-wip-yuantong": {
-      "appId": "xxx",
-      "appSecret": "xxx",
-      "name": "淮安源通制帽-"
+      "appId": "cli_aa38ab65dff91be5",
+      "appSecret": "rehCCQi0D2uIfjE1QOQuUexjRxsZqXEK",
+      "name": "淮安源通制帽-来邮速递"
     },
     "asi-wip-weide": {
-      "appId": "xxx",
-      "appSecret": "xxx",
-      "name": "淮安伟德服饰-"
+      "appId": "cli_aa3898194a79dbc2",
+      "appSecret": "4y3VQuotVgvWI2bf1kiqUchXEANSbkrL",
+      "name": "淮安伟德服饰-来邮速递"
     },
     "asi-wip-yuanda": {
-      "appId": "xxx",
-      "appSecret": "xxx",
-      "name": "淮安远达服饰-"
+      "appId": "cli_aa3b4cadcd785bef",
+      "appSecret": "R6NeBRY9YsAvfYpzYliPEeFGbOQzDEL0",
+      "name": "淮安远达服饰-来邮速递"
     },
     "asi-wip-chuangshiji": {
-      "appId": "xxx",
-      "appSecret": "xxx",
-      "name": "淮安创世纪服饰-"
+      "appId": "cli_aa3899ac0038dbc3",
+      "appSecret": "hCSDjOiTAVDQeAyTYORmueG8CIDQIew6",
+      "name": "淮安创世纪服饰-来邮速递"
     },
     "asi-wip-fantai": {
-      "appId": "xxx",
-      "appSecret": "xxx",
-      "name": "上海泛太制帽-"
+      "appId": "cli_aa389452f5e3dbda",
+      "appSecret": "3ZfQcWKiMdIufhcbGioC8efiYAndvbpN",
+      "name": "上海泛太制帽-来邮速递"
     },
     "asi-wip-yayuan": {
-      "appId": "xxx",
-      "appSecret": "xxx",
-      "name": "江苏亚源-"
+      "appId": "cli_aa38a5c329f81bb7",
+      "appSecret": "Ds31jtz2Z3jFu0BHjgGVPbLCoGxjQ1Rb",
+      "name": "江苏亚源-来邮速递"
     },
     "asi-wip-shanghaiyayuan": {
-      "appId": "xxx",
-      "appSecret": "xxx",
-      "name": "上海亚源-"
+      "appId": "cli_aa3b4aa9f6ba5bb5",
+      "appSecret": "gn2PqTRyxS2BHg3dwn7aUeaL2omALfSz",
+      "name": "上海亚源-来邮速递"
+    },
+    "asi-wip-test": {
+      "appId": "cli_aa2dd7ce3aba5bfb",
+      "appSecret": "dQRH3ysaSUTJm97ei9FcbbxacqPyBDiD",
+      "name": "测试账号-来邮速递"
     }
   }
 }

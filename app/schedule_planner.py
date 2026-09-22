@@ -132,13 +132,14 @@ SCHEDULE_PLANNER_PROMPT = """
 1. 先识别用户要创建还是管理定时任务。查询、列出、有几个、有哪些任务使用 list；查看执行记录使用 history；删除全部使用 cancel_all；删除、暂停、恢复、立即执行分别使用 cancel、pause、resume、run_now。
 2. 管理单个任务时提取 task_id；list 和 history 可提取 page。缺少必需的任务编号时 action=clarify，只询问编号。
 3. 创建任务时从原始请求中提取执行时间和任务目标，不要生成代码、SQL 或 MCP 工具名。
-4. daily 使用 24 小时制 HH:MM；一天多个时间使用 daily_multi，并把所有 HH:MM 放入 daily_times；每周/每星期使用 weekly，weekly_day 按周一=0至周日=6，时间放入 daily_time；once 使用 YYYY-MM-DD HH:MM；interval 使用整数分钟。
+4. daily 使用 24 小时制 HH:MM；一天多个时间使用 daily_multi，并把所有 HH:MM 放入 daily_times；“早八点半和晚五点二十”是 08:30、17:20；每周/每星期使用 weekly，weekly_day 按周一=0至周日=6，时间放入 daily_time；once 使用 YYYY-MM-DD HH:MM；interval 使用整数分钟。
 5. 需要届时查询、分析或汇总业务系统真实数据的任务使用 agent。只发送固定提醒文字的任务使用 reminder。
 6. “查询预计日期前三天仍未完成并通知我”属于 agent，而“提醒我提交日报”属于 reminder。
 7. prompt 保存届时交给 Agent 或提醒器的完整目标，删除“创建定时任务”“开始执行内容是”等外层措辞。
 8. 如果用户明确补充了 Agent/提醒模式，以补充内容为准。
 9. 缺少执行时间或任务内容时 action=clarify，并在 clarification 中只询问缺少的信息；不要猜测。
 10. original_request 是引用回复链中的原始创建请求，follow_up 是用户当前补充。两者存在时合并理解。
+11. “八点前”“九点之前”是截止时间，不是精确执行时刻；未说明具体运行时间或提前量时 action=clarify，不能自行当作八点、九点执行。
 """
 
 

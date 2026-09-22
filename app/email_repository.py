@@ -274,6 +274,55 @@ async def list_recent_messages(account_id: int, lookback_hours: int, limit: int 
     return await _run(_list_recent_messages, account_id, lookback_hours, limit)
 
 
+async def search_messages(
+    account_id: int, start: datetime, end: datetime,
+    sender: str | None, subject: str | None,
+) -> list[dict[str, Any]]:
+    return await _run(_search_messages, account_id, start, end, sender, subject)
+
+
+def _search_messages(
+    account_id: int, start: datetime, end: datetime,
+    sender: str | None, subject: str | None,
+) -> list[dict[str, Any]]:
+    clauses = ["m.email_account_id = ?", "m.sent_at >= ?", "m.sent_at < ?"]
+    params: list[Any] = [account_id, start, end]
+    if sender:
+        clauses.append("CHARINDEX(?, COALESCE(m.sender_name, '') + ' ' + COALESCE(m.sender_address, '')) > 0")
+        params.append(sender)
+    if subject:
+        clauses.append("CHARINDEX(?, COALESCE(m.subject, '')) > 0")
+        params.append(subject)
+    with _open_connection() as connection:
+        cursor = connection.execute(
+            "SELECT TOP 20 m.id, m.sent_at, m.sender_name, m.sender_address, m.subject "
+            "FROM asi.email_message m WHERE " + " AND ".join(clauses) +
+            " ORDER BY m.sent_at DESC, m.id DESC",
+            *params,
+        )
+        return _rows(cursor)
+
+
+async def get_message(account_id: int, message_id: int) -> dict[str, Any] | None:
+    return await _run(_get_message, account_id, message_id)
+
+
+def _get_message(account_id: int, message_id: int) -> dict[str, Any] | None:
+    with _open_connection() as connection:
+        cursor = connection.execute(
+            """
+            SELECT m.*, a.summary, a.importance, a.requires_attention, a.relation_type,
+                   a.todos_json, a.possible_owner, a.deadline, a.risks_json
+            FROM asi.email_message m
+            LEFT JOIN asi.email_analysis a ON a.email_message_id = m.id
+            WHERE m.email_account_id = ? AND m.id = ?
+            """,
+            account_id, message_id,
+        )
+        rows = _rows(cursor)
+        return rows[0] if rows else None
+
+
 async def count_recent_messages(account_id: int, lookback_hours: int) -> int:
     return await _run(_count_recent_messages, account_id, lookback_hours)
 

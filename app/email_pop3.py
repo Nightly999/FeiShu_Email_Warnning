@@ -61,6 +61,30 @@ def count_pop3_messages(*, host: str, port: int, username: str, password: str, t
         _quit(client)
 
 
+def fetch_message_by_uidl(
+    *, host: str, port: int, username: str, password: str,
+    timeout: int, uidl: str, max_body_chars: int,
+) -> ParsedEmail | None:
+    client = _login(host, port, username, password, timeout)
+    try:
+        try:
+            response, lines, _ = client.uidl()
+        except poplib.error_proto as exc:
+            raise EmailConnectionError("邮箱服务器不支持 UIDL") from exc
+        if not response.startswith(b"+OK"):
+            raise EmailConnectionError("邮箱服务器不支持 UIDL")
+        for line in lines:
+            number, found_uidl = _uidl_entry(line)
+            if found_uidl == uidl:
+                response, message_lines, _ = client.retr(number)
+                if response.startswith(b"+OK"):
+                    return parse_message(uidl, b"\r\n".join(message_lines), max_body_chars)
+                break
+        return None
+    finally:
+        _quit(client)
+
+
 def fetch_recent_messages(
     *,
     host: str,
