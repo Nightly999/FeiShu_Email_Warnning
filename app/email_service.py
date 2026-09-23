@@ -48,7 +48,20 @@ from app.settings import get_settings
 
 
 logger = logging.getLogger("email_feature")
-EMAIL_WORDS = ("邮件", "邮箱", "收件箱", "抄送", "email", "mail")
+EMAIL_WORDS = (
+    "邮件",
+    "邮箱",
+    "收件箱",
+    "主送",
+    "抄送",
+    "发件人",
+    "收件人",
+    "待回复",
+    "未回复",
+    "outlook",
+    "email",
+    "mail",
+)
 MAX_EMAIL_QUERY_MESSAGES = 999
 HISTORICAL_LOOKBACK_HOURS = 24 * 365 * 10
 CARD_EMAIL_DETAIL_LIMIT = 20
@@ -62,11 +75,14 @@ _cancelled_commands: set[str] = set()
 
 class EmailPlan(BaseModel):
     action: Literal[
-        "query", "search", "count", "bind", "rebind", "unbind", "status", "retention", "unrelated"
+        "query", "search", "count", "bind", "rebind", "unbind", "status", "retention",
+        "clarify", "unrelated",
     ]
+    clarification: str | None = Field(default=None, max_length=500)
     count_kind: Literal["all", "recent", "unread"] = "all"
     lookback_hours: int = Field(default=48, ge=1, le=HISTORICAL_LOOKBACK_HOURS)
-    scope: Literal["all", "to", "cc", "mentioned"] = "all"
+    scope: Literal["all", "to", "cc", "to_or_cc", "mentioned"] = "all"
+    group_by_recipient: bool = False
     important_only: bool = False
     reply_needed_only: bool = False
     limit: int = Field(default=MAX_EMAIL_QUERY_MESSAGES, ge=1, le=MAX_EMAIL_QUERY_MESSAGES)
@@ -175,6 +191,11 @@ async def handle_email_command(event: dict[str, Any]) -> EmailCommandResult | No
     plan = EmailPlan(action="query") if selected else await plan_email_request(text)
     if plan.action == "unrelated":
         return None
+    if plan.action == "clarify":
+        return EmailCommandResult(
+            plan.clarification
+            or "我知道你要处理邮件，但还缺少具体目标。请说明要查询、筛选、分析还是设置定时推送。"
+        )
     scope = (event["tenant_key"], event["app_id"], event["open_id"])
     try:
         account = await get_email_account(*scope)
@@ -359,12 +380,17 @@ async def plan_email_request(text: str) -> EmailPlan:
         "无额外筛选条件的邮件数量问题选择 count：邮箱总数用 count_kind=all，"
         "指定时间范围的数量用 recent，未读数量用 unread（POP3 无法得知未读状态）。"
         "未说明时间时用 48 小时；今天按当天零点至今、本周按周一零点至今；"
-        "把用户要求的邮件数量写入 limit（最多100）；用户要求历史邮件但未指定日期时，"
+        "把用户要求的邮件数量写入 limit（无上限）；用户要求历史邮件但未指定日期时，"
         f"lookback_hours 设为 {HISTORICAL_LOOKBACK_HOURS}；指定发件人、主题、正文关键词时分别填写"
         " sender_contains、subject_contains、keywords；‘第1封/第3封’按从新到旧写入"
         " message_positions；‘未处理/新邮件’设置 only_unprocessed=true，未读绝不能等同于未处理。"
         "用户询问‘哪些邮件没回复/需要我回复/待回复邮件’时设置 reply_needed_only=true；"
         "这表示按邮件内容推测需要回复，不代表已经核验已发送邮件。"
+        "用户要求把直接发给我的邮件与抄送给我的邮件分组时，scope=to_or_cc，"
+        "group_by_recipient=true。"
+        "属于邮箱请求但目标、范围或时间存在关键歧义时，action=clarify，"
+        "clarification 只询问缺少的信息；当前能力不支持的操作也用 clarify 说明限制和替代方式。"
+        "邮箱请求绝不能选择 unrelated。"
         "不要补充用户没有提出的筛选条件。当前北京时间："
         + datetime.now(timezone(timedelta(hours=8))).isoformat(timespec="minutes")
         + "\n用户请求："
@@ -387,15 +413,21 @@ async def plan_email_request(text: str) -> EmailPlan:
 
 
 def _validated_plan(plan: EmailPlan, settings, text: str = "") -> EmailPlan:
+    fallback = _fallback_plan(text, settings)
+    if plan.action == "unrelated" and fallback.action != "unrelated":
+        plan = fallback
     if plan.retention_days is not None:
         plan.retention_days = max(
             settings.email_min_retention_days,
             min(settings.email_max_retention_days, plan.retention_days),
         )
-    if _fallback_plan(text, settings).action == "search" and plan.action in {"query", "unrelated"}:
+    if fallback.action == "search" and plan.action in {"query", "unrelated"}:
         plan.action = "search"
     if plan.action in {"query", "search", "count"}:
-        plan = plan.model_copy(update=_explicit_query_controls(text))
+        updates = _explicit_query_controls(text)
+        if fallback.group_by_recipient:
+            updates.update(scope="to_or_cc", group_by_recipient=True)
+        plan = plan.model_copy(update=updates)
     return plan
 
 
@@ -425,6 +457,17 @@ def _fallback_plan(text: str, settings) -> EmailPlan:
         return EmailPlan(action="retention", retention_days=days)
     if not looks_like_email_request(text):
         return EmailPlan(action="unrelated")
+    if any(
+        word in text
+        for word in ("转发邮件", "回复邮件", "删除邮件", "移动邮件", "归档邮件", "标记已读", "打标签")
+    ):
+        return EmailPlan(
+            action="clarify",
+            clarification=(
+                "当前仅支持邮件查询、筛选、分析和定时推送，暂不支持修改邮箱内容。"
+                "请改为说明要查找或分析哪些邮件。"
+            ),
+        )
     count_kind = _explicit_count_kind(text)
     hours = settings.email_initial_lookback_hours
     now = datetime.now(timezone(timedelta(hours=8)))
@@ -438,7 +481,20 @@ def _fallback_plan(text: str, settings) -> EmailPlan:
     controls = _explicit_query_controls(text)
     hours = int(controls.get("lookback_hours", hours))
     controls["lookback_hours"] = hours
-    scope = "cc" if "抄送" in text else "to" if "收件人" in text else "mentioned" if "提到我" in text or "@我" in text else "all"
+    group_by_recipient = "抄送" in text and bool(
+        re.search(r"(?:直接(?:写|发|发送)?给我|主送|收件人)", text)
+    )
+    scope = (
+        "to_or_cc"
+        if group_by_recipient
+        else "cc"
+        if "抄送" in text
+        else "to"
+        if "收件人" in text or "主送" in text
+        else "mentioned"
+        if "提到我" in text or "@我" in text
+        else "all"
+    )
     search_only = "分析" not in text and (
         any(word in text for word in ("查找", "搜索", "找出"))
         or ("查询" in text and any(word in text for word in ("某封", "一周前", "天前", "主题")))
@@ -447,6 +503,7 @@ def _fallback_plan(text: str, settings) -> EmailPlan:
         action="count" if count_kind else "search" if search_only else "query",
         count_kind=count_kind or "all",
         scope=scope,
+        group_by_recipient=group_by_recipient,
         important_only="重要" in text or "紧急" in text,
         **controls,
     )
@@ -751,6 +808,7 @@ def build_email_report(
     account: dict[str, Any], messages: list[dict[str, Any]], plan: EmailPlan,
     *, range_label: str | None = None,
 ) -> str:
+    messages = _group_recipient_messages(messages, plan)
     if not messages:
         if plan.reply_needed_only:
             return (
@@ -774,7 +832,14 @@ def build_email_report(
     ]
     if plan.reply_needed_only:
         parts.append("- 说明：POP3 无法读取已发送邮件，以下仅为可能需要回复的邮件。")
+    last_relation = ""
     for index, item in enumerate(messages, 1):
+        relation = str(item.get("relation_type") or "其他")
+        if plan.group_by_recipient and relation != last_relation:
+            parts.append(
+                "\n### 直接发给我的" if relation == "To" else "\n### 抄送给我的"
+            )
+            last_relation = relation
         todos = _json_list(item.get("todos_json"))
         risks = _json_list(item.get("risks_json"))
         attachments = _json_list(item.get("attachments_json"), names=True)
@@ -800,6 +865,7 @@ def build_email_report_card(
     account: dict[str, Any], messages: list[dict[str, Any]], plan: EmailPlan,
     *, range_label: str | None = None, page: int = 1, run_ref: str | None = None,
 ) -> dict[str, Any]:
+    messages = _group_recipient_messages(messages, plan)
     masked_email = escape_lark_md(_mask_email(account["email_address"]))
     range_label = range_label or (
         "历史邮件"
@@ -851,6 +917,7 @@ def build_email_report_card(
                     ),
                 },
             )
+        last_relation = ""
         for index, item in enumerate(page_messages, start + 1):
             importance = item.get("importance") or "未分析"
             icon = {"高": "🔴", "中": "🟠", "低": "🟢"}.get(importance, "⚪")
@@ -870,6 +937,13 @@ def build_email_report_card(
                 f"**分析结果**　{summary}",
                 f"**需要你做**　{escape_lark_md('；'.join(todos) if todos else '无明确待办')}",
             ]
+            relation = str(item.get("relation_type") or "其他")
+            if plan.group_by_recipient and relation != last_relation:
+                lines.insert(
+                    0,
+                    "### 📥 直接发给我的" if relation == "To" else "### 📎 抄送给我的",
+                )
+                last_relation = relation
             if item.get("possible_owner") or item.get("deadline"):
                 lines.append(
                     "**负责人 / 截止**　"
@@ -893,9 +967,17 @@ def build_email_report_card(
         if total_pages > 1 and run_ref:
             actions = []
             if page > 1:
-                actions.append(_email_page_button("← 上一页", run_ref, page - 1))
+                actions.append(
+                    _email_page_button(
+                        "← 上一页", run_ref, page - 1, plan.group_by_recipient
+                    )
+                )
             if page < total_pages:
-                actions.append(_email_page_button("下一页 →", run_ref, page + 1))
+                actions.append(
+                    _email_page_button(
+                        "下一页 →", run_ref, page + 1, plan.group_by_recipient
+                    )
+                )
             elements.append(
                 {
                     "tag": "form",
@@ -921,7 +1003,12 @@ def build_email_report_card(
     }
 
 
-def _email_page_button(text: str, run_ref: str, page: int) -> dict[str, Any]:
+def _email_page_button(
+    text: str, run_ref: str, page: int, group_by_recipient: bool
+) -> dict[str, Any]:
+    value: dict[str, Any] = {"action": "email_page", "run_ref": run_ref, "page": page}
+    if group_by_recipient:
+        value["group_by_recipient"] = True
     return {
         "tag": "button",
         "name": f"email_page_{page}",
@@ -932,14 +1019,15 @@ def _email_page_button(text: str, run_ref: str, page: int) -> dict[str, Any]:
         "behaviors": [
             {
                 "type": "callback",
-                "value": {"action": "email_page", "run_ref": run_ref, "page": page},
+                "value": value,
             }
         ],
     }
 
 
 async def render_email_report_page(
-    tenant_key: str, app_id: str, open_id: str, run_ref: str, page: int
+    tenant_key: str, app_id: str, open_id: str, run_ref: str, page: int,
+    *, group_by_recipient: bool = False,
 ) -> dict[str, Any] | None:
     messages = await list_push_run_messages(tenant_key, app_id, open_id, run_ref)
     if not messages:
@@ -947,7 +1035,12 @@ async def render_email_report_page(
     return build_email_report_card(
         {"email_address": messages[0]["email_address"]},
         messages,
-        EmailPlan(action="query", limit=len(messages)),
+        EmailPlan(
+            action="query",
+            limit=len(messages),
+            scope="to_or_cc" if group_by_recipient else "all",
+            group_by_recipient=group_by_recipient,
+        ),
         range_label="本次分析",
         page=page,
         run_ref=run_ref,
@@ -1083,9 +1176,19 @@ def _matches(message: dict[str, Any], email_address: str, display_name: str, sco
         return in_to
     if scope == "cc":
         return in_cc
+    if scope == "to_or_cc":
+        return in_to or in_cc
     if scope == "mentioned":
         return mentioned
     return in_to or in_cc or mentioned or message.get("analysis_status") != "success" or message.get("push_status") != "success"
+
+
+def _group_recipient_messages(
+    messages: list[dict[str, Any]], plan: EmailPlan
+) -> list[dict[str, Any]]:
+    if not plan.group_by_recipient:
+        return messages
+    return sorted(messages, key=lambda item: item.get("relation_type") != "To")
 
 
 def _select_messages(

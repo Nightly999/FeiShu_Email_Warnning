@@ -43,6 +43,7 @@ from app.email_service import (
 from app.feishu import TenantApp
 from app.feishu_ws import (
     CardCallbackWsClient,
+    dispatch_event,
     extract_email_bind_card_action,
     extract_email_page_card_action,
     process_email_page_card,
@@ -224,6 +225,16 @@ def test_email_fallback_plan_applies_scope_and_bounds() -> None:
     assert history.limit == 80
     assert _fallback_plan("有多少封重要邮件", settings).action == "query"
 
+    grouped_text = "请把这100封邮件按照直接写给我的和抄送给我的分成两类"
+    grouped = _fallback_plan(grouped_text, settings)
+    assert grouped.action == "query"
+    assert grouped.limit == 100
+    assert grouped.scope == "to_or_cc"
+    assert grouped.group_by_recipient is True
+    assert _validated_plan(
+        EmailPlan(action="unrelated"), settings, grouped_text
+    ).group_by_recipient is True
+
 
 def test_stop_email_analysis_cancels_only_the_current_user(monkeypatch) -> None:
     event = {"tenant_key": "tenant", "app_id": "app", "open_id": "user"}
@@ -246,6 +257,46 @@ def test_stop_email_analysis_cancels_only_the_current_user(monkeypatch) -> None:
     asyncio.run(scenario())
     assert is_stop_email_analysis_command("停止当前分析") is True
     assert is_stop_email_analysis_command("停止定时任务") is False
+
+
+def test_text_processing_exception_replaces_progress_card_with_input_guide(monkeypatch) -> None:
+    app = TenantApp("tenant", "app", "secret", None, None, "bot", None)
+    monkeypatch.setattr(
+        "app.feishu_ws.get_active_session_id", AsyncMock(return_value="session")
+    )
+    monkeypatch.setattr("app.feishu_ws.hydrate_reply_context", AsyncMock())
+    monkeypatch.setattr(
+        "app.feishu_ws.reply_card", AsyncMock(return_value="progress-message")
+    )
+    monkeypatch.setattr(
+        "app.feishu_ws.handle_builtin_text_command",
+        AsyncMock(side_effect=RuntimeError("boom")),
+    )
+    update = AsyncMock(return_value=True)
+    monkeypatch.setattr("app.feishu_ws.update_card", update)
+    event = {
+        "tenant_key": "tenant",
+        "app_id": "app",
+        "bot_code": "bot",
+        "open_id": "user",
+        "chat_id": "chat",
+        "message_id": "message",
+        "message_type": "text",
+        "text": "帮我处理邮件",
+    }
+
+    with pytest.raises(RuntimeError, match="boom"):
+        asyncio.run(dispatch_event(app, event))
+
+    guide_card = update.await_args.args[2]
+    assert update.await_args.args[:2] == (app, "progress-message")
+    assert guide_card["header"]["title"]["content"] == "请完善指令"
+    assert guide_card["header"]["template"] == "orange"
+    content = guide_card["body"]["elements"][0]["content"]
+    assert "动作 + 邮件范围 + 时间或数量 + 期望结果" in content
+    assert "每天上午9点分析未处理邮件并推送给我" in content
+    assert "失败" not in content
+    assert "错误" not in content
 
 
 def test_explicit_email_login_skips_model_planning(
@@ -461,6 +512,52 @@ def test_model_recognizes_dynamic_email_account_command(
     plan = asyncio.run(plan_email_request("更换账号"))
 
     assert plan.action == "rebind"
+
+
+def test_ambiguous_email_command_returns_specific_clarification(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    response = type(
+        "Response",
+        (),
+        {
+            "tool_calls": [
+                {
+                    "name": "plan_email_request",
+                    "args": {
+                        "action": "clarify",
+                        "clarification": "请说明要分析的时间范围。",
+                    },
+                }
+            ]
+        },
+    )()
+    account_lookup = AsyncMock()
+    monkeypatch.setattr(
+        "app.email_service.invoke_chat_with_fallback", AsyncMock(return_value=response)
+    )
+    monkeypatch.setattr("app.email_service.get_email_account", account_lookup)
+
+    result = asyncio.run(
+        handle_email_command(
+            {
+                "text": "帮我处理一下邮箱里的内容",
+                "tenant_key": "tenant",
+                "app_id": "app",
+                "open_id": "user",
+            }
+        )
+    )
+
+    assert result.answer == "请说明要分析的时间范围。"
+    account_lookup.assert_not_awaited()
+
+
+def test_unsupported_email_mutation_explains_supported_alternative() -> None:
+    plan = _fallback_plan("把这封邮件转发邮件给王五", get_settings())
+
+    assert plan.action == "clarify"
+    assert "暂不支持" in str(plan.clarification)
 
 
 def test_unrelated_command_returns_to_general_agent(
@@ -858,6 +955,37 @@ def test_email_report_card_paginates_all_details() -> None:
     assert len(second["body"]["elements"][-1]["elements"]) == 2
 
 
+def test_email_report_card_groups_direct_and_cc_messages() -> None:
+    messages = [
+        {
+            "subject": f"邮件 {index}",
+            "sender_address": "sender@example.com",
+            "importance": "中",
+            "requires_attention": False,
+            "relation_type": "Cc" if index <= 10 else "To",
+            "summary": "测试摘要",
+            "todos_json": "[]",
+            "risks_json": "[]",
+            "attachments_json": "[]",
+        }
+        for index in range(1, 22)
+    ]
+    plan = EmailPlan(
+        action="query", scope="to_or_cc", group_by_recipient=True, limit=100
+    )
+
+    card = build_email_report_card(
+        {"email_address": "user@example.com"}, messages, plan, run_ref="run-1"
+    )
+    content = "\n".join(item.get("content", "") for item in card["body"]["elements"])
+    button_value = card["body"]["elements"][-1]["elements"][0]["behaviors"][0][
+        "value"
+    ]
+
+    assert content.index("直接发给我的") < content.index("抄送给我的")
+    assert button_value["group_by_recipient"] is True
+
+
 def test_bind_card_uses_password_input_and_show_toggle() -> None:
     card = build_email_login_card("绑定公司邮箱", "one-time-token")
     form = card["body"]["elements"][1]
@@ -931,7 +1059,12 @@ def test_extract_email_page_action_keeps_user_scope() -> None:
             "context": {"open_chat_id": "chat-1", "open_message_id": "message-1"},
             "action": {
                 "tag": "button",
-                "value": {"action": "email_page", "run_ref": "run-1", "page": 2},
+                "value": {
+                    "action": "email_page",
+                    "run_ref": "run-1",
+                    "page": 2,
+                    "group_by_recipient": True,
+                },
             },
         }
     }
@@ -944,6 +1077,7 @@ def test_extract_email_page_action_keeps_user_scope() -> None:
         "message_id": "message-1",
         "run_ref": "run-1",
         "page": 2,
+        "group_by_recipient": True,
     }
 
 
@@ -966,11 +1100,19 @@ def test_email_page_callback_updates_original_card(monkeypatch: pytest.MonkeyPat
                 "message_id": "message-1",
                 "run_ref": "run-1",
                 "page": 2,
+                "group_by_recipient": True,
             },
         )
     )
 
-    render.assert_awaited_once_with("tenant-1", "app-1", "user-1", "run-1", 2)
+    render.assert_awaited_once_with(
+        "tenant-1",
+        "app-1",
+        "user-1",
+        "run-1",
+        2,
+        group_by_recipient=True,
+    )
     update.assert_awaited_once_with(app, "message-1", card)
 
 

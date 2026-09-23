@@ -510,6 +510,8 @@ def extract_email_page_card_action(
         "run_ref": run_ref,
         "page": page,
     }
+    if value.get("group_by_recipient") is True:
+        result["group_by_recipient"] = True
     if not all(result[key] for key in ("tenant_key", "app_id", "open_id", "chat_id", "message_id")):
         return None
     if not run_ref or len(run_ref) > 100 or not 1 <= page <= 100:
@@ -535,6 +537,7 @@ async def process_email_page_card(
         action["open_id"],
         action["run_ref"],
         action["page"],
+        group_by_recipient=bool(action.get("group_by_recipient")),
     )
     if not card:
         await send_card(
@@ -703,31 +706,53 @@ async def dispatch_event(app: TenantApp, event: dict[str, Any]) -> None:
     if event.get("message_id"):
         progress_message_id = await reply_card(app, event["message_id"], build_processing_card(event["text"]))
         event["_reply_message_id"] = progress_message_id
-    handled = await handle_builtin_text_command(app, event, progress_message_id)
-    if handled:
-        return
-    result = await run_agent(event)
-    answer = result.content
-    if event.get("message_id"):
-        if should_use_card(answer):
-            answer_card = build_answer_card(event["text"], answer, status=result.status)
-            if progress_message_id:
-                updated = await update_card(app, progress_message_id, answer_card)
-                if not updated:
+    try:
+        handled = await handle_builtin_text_command(app, event, progress_message_id)
+        if handled:
+            return
+        result = await run_agent(event)
+        answer = result.content
+        if event.get("message_id"):
+            if should_use_card(answer):
+                answer_card = build_answer_card(event["text"], answer, status=result.status)
+                if progress_message_id:
+                    updated = await update_card(app, progress_message_id, answer_card)
+                    if not updated:
+                        await reply_card(app, event["message_id"], answer_card)
+                else:
                     await reply_card(app, event["message_id"], answer_card)
             else:
-                await reply_card(app, event["message_id"], answer_card)
-        else:
-            if progress_message_id:
-                updated = await update_card(
-                    app,
-                    progress_message_id,
-                    build_answer_card(event["text"], answer, status=result.status),
-                )
-                if not updated:
+                if progress_message_id:
+                    updated = await update_card(
+                        app,
+                        progress_message_id,
+                        build_answer_card(event["text"], answer, status=result.status),
+                    )
+                    if not updated:
+                        await reply_message(app, event["message_id"], answer)
+                else:
                     await reply_message(app, event["message_id"], answer)
-            else:
-                await reply_message(app, event["message_id"], answer)
+    except Exception:
+        if event.get("message_id"):
+            card = build_answer_card(
+                event["text"],
+                (
+                    "请按“动作 + 邮件范围 + 时间或数量 + 期望结果”描述您的需求。\n\n"
+                    "例如：\n"
+                    "- 分析最近两天的邮件\n"
+                    "- 分析最近100封邮件，发送给我的和抄送我的\n"
+                    "- 每天上午9点分析未处理邮件并推送给我\n"
+                    "- 每天上午8点30分下午五点30分，分析未处理邮件并推送给我\n"
+                    "- 查找一周内张三发送的邮件和抄送我的邮件\n"
+                ),
+                status="denied",
+                title="请完善指令",
+            )
+            if not progress_message_id or not await update_card(
+                app, progress_message_id, card
+            ):
+                await reply_card(app, event["message_id"], card)
+        raise
 
 
 async def handle_file_event(app: TenantApp, event: dict[str, Any]) -> None:
