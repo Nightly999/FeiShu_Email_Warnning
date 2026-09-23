@@ -24,7 +24,7 @@ from app.routing.export_intent import should_export_excel
 from app.reply_context import referenced_message_ids
 from app.scheduler import (
     handle_schedule_command,
-    is_execution_mode_reply,
+    is_schedule_followup_reply,
     recent_schedule_creation_request,
     resolve_schedule_command,
 )
@@ -157,7 +157,7 @@ async def handle_builtin_text_command(
         return True
 
     recent_schedule_request = None
-    if not event.get("_referenced_request_text") and is_execution_mode_reply(text):
+    if not event.get("_referenced_request_text") and is_schedule_followup_reply(text):
         recent_schedule_request = await recent_schedule_creation_request(event)
     command = await resolve_schedule_command(
         text,
