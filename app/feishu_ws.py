@@ -43,9 +43,11 @@ from app.event_dedup import claim_event, finish_event
 from app.email_pop3 import EmailAuthenticationError, EmailConnectionError
 from app.email_service import (
     bind_email_account,
+    cancel_email_analysis,
     consume_bind_token,
     get_bind_scope,
     initial_sync,
+    is_stop_email_analysis_command,
     render_email_report_page,
 )
 from app.feishu import (
@@ -348,6 +350,9 @@ def run_client_process(app_payload: dict[str, Any]) -> None:
     def handle_message(data: P2ImMessageReceiveV1) -> None:
         try:
             payload = json.loads(lark.JSON.marshal(data))
+            event = normalize_event(payload, app, trust_event_tenant=True)
+            if is_stop_email_analysis_command(str(event.get("text") or "")):
+                cancel_email_analysis(event, str(event.get("message_id") or ""))
             if not event_slots.acquire(blocking=False):
                 logger.error("Event queue is full: bot_code=%s", app.bot_code)
                 return

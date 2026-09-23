@@ -27,12 +27,15 @@ from app.email_service import (
     EmailPlan,
     _fallback_plan,
     _likely_needs_reply,
+    _run_cancellable_analysis,
     _select_messages,
     _validated_plan,
     analyze_pending,
     build_email_login_card,
     build_email_report,
     build_email_report_card,
+    cancel_email_analysis,
+    is_stop_email_analysis_command,
     plan_email_request,
     sync_analyze_report,
     handle_email_command,
@@ -220,6 +223,29 @@ def test_email_fallback_plan_applies_scope_and_bounds() -> None:
     assert history.lookback_hours == 24 * 365 * 10
     assert history.limit == 80
     assert _fallback_plan("有多少封重要邮件", settings).action == "query"
+
+
+def test_stop_email_analysis_cancels_only_the_current_user(monkeypatch) -> None:
+    event = {"tenant_key": "tenant", "app_id": "app", "open_id": "user"}
+    started = asyncio.Event()
+
+    async def slow_analysis(*_args):
+        started.set()
+        await asyncio.sleep(30)
+
+    async def scenario():
+        monkeypatch.setattr("app.email_service.sync_analyze_report", slow_analysis)
+        runner = asyncio.create_task(
+            _run_cancellable_analysis(event, {}, EmailPlan(action="query"))
+        )
+        await started.wait()
+        assert cancel_email_analysis(event) is True
+        result = await runner
+        assert result.answer == "邮件分析已停止。"
+
+    asyncio.run(scenario())
+    assert is_stop_email_analysis_command("停止当前分析") is True
+    assert is_stop_email_analysis_command("停止定时任务") is False
 
 
 def test_explicit_email_login_skips_model_planning(

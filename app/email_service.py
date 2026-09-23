@@ -6,6 +6,7 @@ import json
 import logging
 import re
 import secrets
+import threading
 import time
 from dataclasses import dataclass
 from datetime import date, datetime, time as datetime_time, timedelta, timezone
@@ -52,6 +53,11 @@ MAX_EMAIL_QUERY_MESSAGES = 999
 HISTORICAL_LOOKBACK_HOURS = 24 * 365 * 10
 CARD_EMAIL_DETAIL_LIMIT = 20
 SEARCH_SYNC_MAX_MESSAGES = 500  # ponytail: bounded POP3 backfill; use a server-side search API for larger mailboxes.
+_analysis_lock = threading.Lock()
+_active_analyses: dict[
+    tuple[str, str, str], tuple[asyncio.AbstractEventLoop, asyncio.Task[EmailCommandResult]]
+] = {}
+_cancelled_commands: set[str] = set()
 
 
 class EmailPlan(BaseModel):
@@ -103,11 +109,65 @@ def looks_like_email_request(text: str) -> bool:
     return any(word in lowered for word in EMAIL_WORDS)
 
 
+def is_stop_email_analysis_command(text: str) -> bool:
+    normalized = re.sub(r"\s+", "", text or "")
+    return normalized in {
+        "停止任务",
+        "停止分析",
+        "取消分析",
+        "终止分析",
+        "停止当前分析",
+        "取消当前分析",
+    }
+
+
+def cancel_email_analysis(event: dict[str, Any], command_id: str = "") -> bool:
+    key = (
+        str(event.get("tenant_key") or ""),
+        str(event.get("app_id") or ""),
+        str(event.get("open_id") or ""),
+    )
+    with _analysis_lock:
+        active = _active_analyses.get(key)
+        if not active or active[1].done():
+            return False
+        if command_id:
+            _cancelled_commands.add(command_id)
+    active[0].call_soon_threadsafe(active[1].cancel)
+    return True
+
+
+async def _run_cancellable_analysis(
+    event: dict[str, Any], account: dict[str, Any], plan: EmailPlan
+) -> EmailCommandResult:
+    key = (str(event["tenant_key"]), str(event["app_id"]), str(event["open_id"]))
+    task = asyncio.create_task(sync_analyze_report(event, account, plan))
+    with _analysis_lock:
+        _active_analyses[key] = (asyncio.get_running_loop(), task)
+    try:
+        return await task
+    except asyncio.CancelledError:
+        return EmailCommandResult("邮件分析已停止。")
+    finally:
+        with _analysis_lock:
+            if _active_analyses.get(key, (None, None))[1] is task:
+                _active_analyses.pop(key, None)
+
+
 async def handle_email_command(event: dict[str, Any]) -> EmailCommandResult | None:
     settings = get_settings()
     text = str(event.get("text") or "")
     if not settings.email_feature_enabled:
         return None
+    if is_stop_email_analysis_command(text):
+        message_id = str(event.get("message_id") or "")
+        with _analysis_lock:
+            stopped = message_id in _cancelled_commands
+            _cancelled_commands.discard(message_id)
+        stopped = cancel_email_analysis(event) or stopped
+        return EmailCommandResult(
+            "邮件分析已停止。" if stopped else "当前没有正在进行的邮件分析。"
+        )
     if event.get("_automation_run") and not looks_like_email_request(text):
         return None
 
@@ -161,7 +221,7 @@ async def handle_email_command(event: dict[str, Any]) -> EmailCommandResult | No
     if "未读" in text:
         return EmailCommandResult("当前邮箱使用 POP3，无法获取准确的已读/未读状态；‘未推送’不等于‘未读’。如需准确查询未读邮件，需要接入支持已读状态的邮箱接口。")
 
-    return await sync_analyze_report(event, account, plan)
+    return await _run_cancellable_analysis(event, account, plan)
 
 
 async def _count_email_command(account: dict[str, Any], plan: EmailPlan) -> EmailCommandResult:
