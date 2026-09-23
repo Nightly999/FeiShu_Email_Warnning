@@ -46,6 +46,7 @@ from app.email_service import (
     consume_bind_token,
     get_bind_scope,
     initial_sync,
+    render_email_report_page,
 )
 from app.feishu import (
     TenantApp,
@@ -392,8 +393,9 @@ def run_client_process(app_payload: dict[str, Any]) -> None:
     def handle_card_action(data: P2CardActionTrigger) -> P2CardActionTriggerResponse:
         try:
             payload = json.loads(lark.JSON.marshal(data))
-            action = extract_email_bind_card_action(payload, app)
-            if not action:
+            page_action = extract_email_page_card_action(payload, app)
+            bind_action = extract_email_bind_card_action(payload, app)
+            if not page_action and not bind_action:
                 return P2CardActionTriggerResponse(
                     {"toast": {"type": "warning", "content": "无法识别该卡片操作。"}}
                 )
@@ -403,21 +405,26 @@ def run_client_process(app_payload: dict[str, Any]) -> None:
                 )
             try:
                 future = event_executor.submit(
-                    process_email_bind_card_thread,
+                    process_email_page_card_thread if page_action else process_email_bind_card_thread,
                     app_payload,
-                    action,
+                    page_action or bind_action,
                 )
                 future.add_done_callback(release_event_slot)
             except Exception:
                 event_slots.release()
                 raise
             return P2CardActionTriggerResponse(
-                {"toast": {"type": "info", "content": "正在验证邮箱账号，请稍候…"}}
+                {
+                    "toast": {
+                        "type": "info",
+                        "content": "正在切换页面…" if page_action else "正在验证邮箱账号，请稍候…",
+                    }
+                }
             )
         except Exception:
-            logger.exception("Failed to enqueue card callback: bot_code=%s", app.bot_code)
+            logger.exception("Failed to enqueue card action: bot_code=%s", app.bot_code)
             return P2CardActionTriggerResponse(
-                {"toast": {"type": "error", "content": "邮箱绑定请求处理失败，请重试。"}}
+                {"toast": {"type": "error", "content": "卡片操作失败，请重试。"}}
             )
 
     event_handler = (
@@ -469,6 +476,70 @@ def extract_email_bind_card_action(
     if not all(result.values()):
         return None
     return result
+
+
+def extract_email_page_card_action(
+    payload: dict[str, Any], app: TenantApp
+) -> dict[str, Any] | None:
+    event = payload.get("event") or {}
+    operator = event.get("operator") or {}
+    action = event.get("action") or {}
+    value = action.get("value") or {}
+    context = event.get("context") or {}
+    if value.get("action") != "email_page" or action.get("tag") != "button":
+        return None
+    tenant_key = str(operator.get("tenant_key") or app.tenant_key or "")
+    if app.tenant_key and tenant_key != app.tenant_key:
+        return None
+    try:
+        page = int(value.get("page") or 0)
+    except (TypeError, ValueError):
+        return None
+    run_ref = str(value.get("run_ref") or "")
+    result = {
+        "tenant_key": tenant_key,
+        "app_id": app.app_id,
+        "open_id": str(operator.get("open_id") or ""),
+        "chat_id": str(context.get("open_chat_id") or ""),
+        "message_id": str(context.get("open_message_id") or ""),
+        "run_ref": run_ref,
+        "page": page,
+    }
+    if not all(result[key] for key in ("tenant_key", "app_id", "open_id", "chat_id", "message_id")):
+        return None
+    if not run_ref or len(run_ref) > 100 or not 1 <= page <= 100:
+        return None
+    return result
+
+
+def process_email_page_card_thread(
+    app_payload: dict[str, Any], action: dict[str, Any]
+) -> None:
+    try:
+        asyncio.run(process_email_page_card(TenantApp(**app_payload), action))
+    except Exception:
+        logger.exception("Failed to process email page card")
+
+
+async def process_email_page_card(
+    app: TenantApp, action: dict[str, Any]
+) -> None:
+    card = await render_email_report_page(
+        action["tenant_key"],
+        action["app_id"],
+        action["open_id"],
+        action["run_ref"],
+        action["page"],
+    )
+    if not card:
+        await send_card(
+            app,
+            action["chat_id"],
+            build_answer_card("邮件分析", "分页结果不存在或已过期。", status="error"),
+        )
+        return
+    if not await update_card(app, action["message_id"], card):
+        await send_card(app, action["chat_id"], card)
 
 
 def process_email_bind_card_thread(

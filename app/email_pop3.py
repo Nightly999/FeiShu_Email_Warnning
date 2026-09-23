@@ -1,19 +1,32 @@
 from __future__ import annotations
 
+import csv
+import io
 import poplib
 import ssl
+import zipfile
+from collections import Counter
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from email import policy
 from email.message import Message
 from email.parser import BytesParser
 from email.utils import getaddresses, parsedate_to_datetime
+from pathlib import Path
 from typing import Any
+from xml.etree import ElementTree
+
+from openpyxl import load_workbook
 
 
 # Some corporate mail systems return minified HTML as one long POP3 line.
 # Python's 2 KiB default rejects otherwise valid messages before parsing them.
 poplib._MAXLINE = 10 * 1024 * 1024
+# ponytail: bound inline attachment work; move large/many files to a background worker if needed.
+MAX_ANALYZED_ATTACHMENTS = 3
+MAX_ATTACHMENT_BYTES = 5 * 1024 * 1024
+MAX_ATTACHMENT_ANALYSIS_CHARS = 1500
+MAX_UNPACKED_BYTES = 20 * 1024 * 1024
 
 
 class EmailAuthenticationError(RuntimeError):
@@ -146,13 +159,17 @@ def parse_message(uidl: str, raw: bytes, max_body_chars: int) -> ParsedEmail:
         filename = part.get_filename()
         payload = part.get_payload(decode=True) or b""
         if disposition == "attachment" or filename:
-            attachments.append(
-                {
-                    "name": str(filename or "未命名附件"),
-                    "mime_type": part.get_content_type(),
-                    "size": len(payload),
-                }
-            )
+            name = str(filename or "未命名附件")
+            attachment = {
+                "name": name,
+                "mime_type": part.get_content_type(),
+                "size": len(payload),
+            }
+            if len(attachments) < MAX_ANALYZED_ATTACHMENTS:
+                analysis = _analyze_attachment(name, payload)
+                if analysis:
+                    attachment["analysis"] = analysis
+            attachments.append(attachment)
             continue
         content = _part_text(part, payload)
         if part.get_content_type() == "text/plain":
@@ -177,6 +194,108 @@ def parse_message(uidl: str, raw: bytes, max_body_chars: int) -> ParsedEmail:
         html_body="\n".join(html_parts)[:limit],
         attachments=attachments,
     )
+
+
+def _analyze_attachment(filename: str, payload: bytes) -> str | None:
+    suffix = Path(filename).suffix.lower()
+    if suffix not in {".xlsx", ".docx", ".csv", ".txt", ".md", ".log"}:
+        return None
+    if len(payload) > MAX_ATTACHMENT_BYTES:
+        return "附件超过 5 MB，未自动分析。"
+    try:
+        if suffix == ".xlsx":
+            return _analyze_xlsx(payload)
+        if suffix == ".docx":
+            return _analyze_docx(payload)
+        text = payload.decode("utf-8-sig", errors="replace")
+        if suffix == ".csv":
+            rows = list(csv.reader(io.StringIO(text)))[:8]
+            preview = "；".join(" | ".join(_cell(value) for value in row[:6]) for row in rows)
+            return f"CSV 表格预览：{preview or '空文件'}"
+        return "文本内容：" + (
+            " ".join(text.split())[:MAX_ATTACHMENT_ANALYSIS_CHARS] or "空文件"
+        )
+    except Exception:
+        return "附件格式异常，无法自动分析。"
+
+
+def _analyze_xlsx(payload: bytes) -> str:
+    if _unpacked_size(payload) > MAX_UNPACKED_BYTES:
+        return "Excel 解压后超过 20 MB，未自动分析。"
+    workbook = load_workbook(io.BytesIO(payload), read_only=True, data_only=True)
+    try:
+        parts = [f"Excel，共 {len(workbook.sheetnames)} 个工作表"]
+        for name in workbook.sheetnames[:3]:
+            sheet = workbook[name]
+            rows = [
+                [_cell(value) for value in row]
+                for row in sheet.iter_rows(values_only=True)
+                if any(value not in (None, "") for value in row)
+            ]
+            if not rows:
+                parts.append(f"{name}：空表")
+                continue
+            header_index = max(
+                range(min(20, len(rows))),
+                key=lambda index: sum(bool(value) for value in rows[index]),
+            )
+            header = rows[header_index]
+            columns = [
+                index
+                for index, value in enumerate(header)
+                if value or any(index < len(row) and row[index] for row in rows[header_index + 1 :])
+            ]
+            data = [
+                row
+                for row in rows[header_index + 1 :]
+                if sum(bool(row[index]) for index in columns if index < len(row)) >= min(2, len(columns))
+            ]
+            labels = [(header[index] or f"第{index + 1}列")[:24] for index in columns]
+            summary = f"{name}：{len(data)} 条有效数据，{len(columns)} 个字段"
+            if labels:
+                summary += "；字段：" + "、".join(labels)
+            stats = []
+            samples = []
+            for index, label in zip(columns, labels):
+                values = [row[index] for row in data if index < len(row) and row[index]]
+                counts = Counter(values)
+                if values and len(counts) <= min(8, max(2, len(values) // 2)):
+                    stats.append(
+                        f"{label}="
+                        + "、".join(f"{value[:24]} {count}" for value, count in counts.most_common(3))
+                    )
+                elif len(values) >= 3 and sum(map(len, values)) / len(values) >= 8:
+                    samples.append(f"{label}样本=" + "｜".join(value[:60] for value in values[:2]))
+            if stats:
+                summary += "；统计：" + "；".join(stats[:5])
+            if samples:
+                summary += "；开放反馈：" + "；".join(samples[:2])
+            parts.append(summary)
+        return "；".join(parts)[:MAX_ATTACHMENT_ANALYSIS_CHARS]
+    finally:
+        workbook.close()
+
+
+def _analyze_docx(payload: bytes) -> str:
+    if _unpacked_size(payload) > MAX_UNPACKED_BYTES:
+        return "Word 解压后超过 20 MB，未自动分析。"
+    with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+        root = ElementTree.fromstring(archive.read("word/document.xml"))
+    text = " ".join(
+        str(node.text or "").strip()
+        for node in root.iter()
+        if node.tag.endswith("}t") and str(node.text or "").strip()
+    )
+    return "Word 文档内容：" + (text[:MAX_ATTACHMENT_ANALYSIS_CHARS] or "空文档")
+
+
+def _unpacked_size(payload: bytes) -> int:
+    with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+        return sum(item.file_size for item in archive.infolist())
+
+
+def _cell(value: Any) -> str:
+    return " ".join(str(value if value is not None else "").split())[:80]
 
 
 def _login(host: str, port: int, username: str, password: str, timeout: int) -> poplib.POP3_SSL:

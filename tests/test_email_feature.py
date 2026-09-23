@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import io
 import os
 import poplib
+import zipfile
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock
@@ -11,8 +13,14 @@ from unittest.mock import AsyncMock
 import pytest
 from lark_oapi.ws.const import HEADER_SEQ, HEADER_SUM, HEADER_TYPE
 from lark_oapi.ws.pb.pbbp2_pb2 import Frame
+from openpyxl import Workbook
 
-from app.email_pop3 import EmailAuthenticationError, count_pop3_messages, parse_message
+from app.email_pop3 import (
+    EmailAuthenticationError,
+    _analyze_attachment,
+    count_pop3_messages,
+    parse_message,
+)
 from app.email_security import decrypt_email_password, encrypt_email_password
 from app.email_service import (
     EmailAnalysis,
@@ -33,6 +41,8 @@ from app.feishu import TenantApp
 from app.feishu_ws import (
     CardCallbackWsClient,
     extract_email_bind_card_action,
+    extract_email_page_card_action,
+    process_email_page_card,
     process_email_bind_card,
 )
 from app.logging_security import redact_sensitive_text
@@ -143,8 +153,49 @@ UERGREFUQQ==\r
     ]
 
 
+def test_excel_and_word_attachments_are_analyzed() -> None:
+    excel = io.BytesIO()
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "订单"
+    sheet.append(["客户", "金额"])
+    sheet.append(["华东客户", 1200])
+    workbook.save(excel)
+
+    word = io.BytesIO()
+    with zipfile.ZipFile(word, "w") as archive:
+        archive.writestr(
+            "word/document.xml",
+            '<w:document xmlns:w="x"><w:body><w:p><w:r><w:t>交付日期为本周五</w:t>'
+            "</w:r></w:p></w:body></w:document>",
+        )
+
+    assert "华东客户" in _analyze_attachment("订单.xlsx", excel.getvalue())
+    assert "交付日期为本周五" in _analyze_attachment("说明.docx", word.getvalue())
+
+
+def test_excel_analysis_ignores_styled_empty_rows_and_summarizes_answers() -> None:
+    excel = io.BytesIO()
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.append(["AI培训反馈收集表"])
+    sheet.append(["姓名", "部门", "满意度", "是否继续使用"])
+    for index in range(18):
+        sheet.append([f"员工{index}", "计划一部" if index < 12 else "业务部", "高", "是"])
+    sheet.cell(row=47, column=1).number_format = "0"
+    workbook.save(excel)
+
+    analysis = _analyze_attachment("反馈.xlsx", excel.getvalue()) or ""
+
+    assert "18 条有效数据，4 个字段" in analysis
+    assert "计划一部 12" in analysis
+    assert "是否继续使用=是 18" in analysis
+    assert "47 行" not in analysis
+
+
 def test_email_fallback_plan_applies_scope_and_bounds() -> None:
     settings = get_settings()
+    assert EmailPlan(action="query").limit == 999
     plan = _fallback_plan("查看最近3天抄送给我的重要邮件", settings)
     assert plan.lookback_hours == 72
     assert plan.scope == "cc"
@@ -639,13 +690,16 @@ def test_email_report_has_no_action_buttons() -> None:
                 "possible_owner": "采购部",
                 "deadline": "本周五",
                 "risks_json": '["逾期风险"]',
-                "attachments_json": '[{"name":"quote.pdf"}]',
+                "attachments_json": (
+                    '[{"name":"quote.xlsx","analysis":"Excel，共1个工作表；报价：2行×2列"}]'
+                ),
             }
         ],
         _fallback_plan("分析最近两天的重要邮件", get_settings()),
     )
     assert "确认报价" in report
-    assert "quote.pdf" in report
+    assert "quote.xlsx" in report
+    assert "附件分析" in report
     assert "已处理" not in report
     assert "忽略按钮" not in report
 
@@ -665,7 +719,9 @@ def test_email_report_card_is_an_ai_briefing_without_table() -> None:
                 "possible_owner": "采购部",
                 "deadline": "今天",
                 "risks_json": '["逾期可能影响交付"]',
-                "attachments_json": '[{"name":"quote.pdf"}]',
+                "attachments_json": (
+                    '[{"name":"quote.docx","analysis":"Word 文档内容：报价有效期为30天"}]'
+                ),
             }
         ],
         EmailPlan(action="query"),
@@ -677,6 +733,8 @@ def test_email_report_card_is_an_ai_briefing_without_table() -> None:
         item.get("content", "") for item in card["body"]["elements"]
     )
     assert "分析结果" in content
+    assert "附件分析" in content
+    assert "报价有效期为30天" in content
     assert "确认报价并回复" in content
     assert "逾期可能影响交付" in content
 
@@ -721,7 +779,7 @@ def test_reply_needed_filter_requires_an_action_and_excludes_no_reply() -> None:
     )
 
 
-def test_history_report_card_states_when_details_are_truncated() -> None:
+def test_email_report_card_paginates_all_details() -> None:
     messages = [
         {
             "subject": f"历史邮件 {index}",
@@ -741,14 +799,37 @@ def test_history_report_card_states_when_details_are_truncated() -> None:
         {"email_address": "user@example.com"},
         messages,
         EmailPlan(action="query", limit=80),
+        run_ref="run-1",
     )
     content = "\n".join(item.get("content", "") for item in card["body"]["elements"])
+    pager = card["body"]["elements"][-1]
 
     assert "共 **80** 封" in content
-    assert "历史邮件" in content
+    assert "第 **1/4** 页" in content
+    assert "历史邮件 1" in content
+    assert "历史邮件 21" not in content
     assert "87600" not in content
-    assert "已完成 **80** 封邮件分析" in content
-    assert "最新 **20** 封" in content
+    assert pager["tag"] == "form"
+    assert pager["elements"][0]["form_action_type"] == "submit"
+    assert pager["elements"][0]["behaviors"][0]["value"] == {
+        "action": "email_page",
+        "run_ref": "run-1",
+        "page": 2,
+    }
+
+    second = build_email_report_card(
+        {"email_address": "user@example.com"},
+        messages,
+        EmailPlan(action="query", limit=80),
+        page=2,
+        run_ref="run-1",
+    )
+    second_content = "\n".join(
+        item.get("content", "") for item in second["body"]["elements"]
+    )
+    assert "第 **2/4** 页" in second_content
+    assert "历史邮件 21" in second_content
+    assert len(second["body"]["elements"][-1]["elements"]) == 2
 
 
 def test_bind_card_uses_password_input_and_show_toggle() -> None:
@@ -814,6 +895,57 @@ def test_extract_email_bind_card_action_rejects_other_tenant() -> None:
     }
 
     assert extract_email_bind_card_action(payload, app) is None
+
+
+def test_extract_email_page_action_keeps_user_scope() -> None:
+    app = TenantApp("tenant-1", "app-1", "secret", None, None, "bot-1", None)
+    payload = {
+        "event": {
+            "operator": {"tenant_key": "tenant-1", "open_id": "user-1"},
+            "context": {"open_chat_id": "chat-1", "open_message_id": "message-1"},
+            "action": {
+                "tag": "button",
+                "value": {"action": "email_page", "run_ref": "run-1", "page": 2},
+            },
+        }
+    }
+
+    assert extract_email_page_card_action(payload, app) == {
+        "tenant_key": "tenant-1",
+        "app_id": "app-1",
+        "open_id": "user-1",
+        "chat_id": "chat-1",
+        "message_id": "message-1",
+        "run_ref": "run-1",
+        "page": 2,
+    }
+
+
+def test_email_page_callback_updates_original_card(monkeypatch: pytest.MonkeyPatch) -> None:
+    app = TenantApp("tenant-1", "app-1", "secret", None, None, "bot-1", None)
+    card = {"body": {"elements": []}}
+    render = AsyncMock(return_value=card)
+    update = AsyncMock(return_value=True)
+    monkeypatch.setattr("app.feishu_ws.render_email_report_page", render)
+    monkeypatch.setattr("app.feishu_ws.update_card", update)
+
+    asyncio.run(
+        process_email_page_card(
+            app,
+            {
+                "tenant_key": "tenant-1",
+                "app_id": "app-1",
+                "open_id": "user-1",
+                "chat_id": "chat-1",
+                "message_id": "message-1",
+                "run_ref": "run-1",
+                "page": 2,
+            },
+        )
+    )
+
+    render.assert_awaited_once_with("tenant-1", "app-1", "user-1", "run-1", 2)
+    update.assert_awaited_once_with(app, "message-1", card)
 
 
 def test_card_callback_frames_reach_the_sdk_dispatcher() -> None:

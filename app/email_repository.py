@@ -404,6 +404,39 @@ async def create_push_logs(message_ids: list[int], push_type: str, task_ref: str
     await _run(_create_push_logs, message_ids, push_type, task_ref, run_ref)
 
 
+async def list_push_run_messages(
+    tenant_key: str, app_id: str, open_id: str, run_ref: str
+) -> list[dict[str, Any]]:
+    return await _run(
+        _list_push_run_messages, tenant_key, app_id, open_id, run_ref
+    )
+
+
+def _list_push_run_messages(
+    tenant_key: str, app_id: str, open_id: str, run_ref: str
+) -> list[dict[str, Any]]:
+    with _open_connection() as connection:
+        cursor = connection.execute(
+            """
+            SELECT m.*, a.summary, a.importance, a.requires_attention, a.relation_type,
+                   a.todos_json, a.possible_owner, a.deadline, a.risks_json,
+                   account.email_address
+            FROM asi.email_push_log p
+            JOIN asi.email_message m ON m.id = p.email_message_id
+            JOIN asi.email_account account ON account.id = m.email_account_id
+            LEFT JOIN asi.email_analysis a ON a.email_message_id = m.id
+            WHERE p.run_ref = ? AND account.tenant_key = ? AND account.app_id = ?
+                  AND account.open_id = ? AND account.enabled = 1
+            ORDER BY p.id
+            """,
+            run_ref,
+            tenant_key,
+            app_id,
+            open_id,
+        )
+        return _rows(cursor)
+
+
 def _create_push_logs(message_ids: list[int], push_type: str, task_ref: str, run_ref: str) -> None:
     with _open_connection() as connection:
         for message_id in message_ids:
@@ -468,6 +501,27 @@ async def cleanup_expired_email_data() -> None:
 def _cleanup_expired_email_data() -> None:
     with _open_connection() as connection:
         connection.execute("DELETE FROM asi.email_analysis WHERE expires_at <= SYSUTCDATETIME()")
+        rows = connection.execute(
+            """
+            SELECT m.id, m.attachments_json
+            FROM asi.email_message m
+            JOIN asi.email_account a ON a.id = m.email_account_id
+            WHERE m.received_at < DATEADD(day, -a.retention_days, SYSUTCDATETIME())
+            """
+        ).fetchall()
+        for message_id, raw_attachments in rows:
+            try:
+                attachments = json.loads(raw_attachments or "[]")
+            except json.JSONDecodeError:
+                attachments = []
+            for attachment in attachments:
+                if isinstance(attachment, dict):
+                    attachment.pop("analysis", None)
+            connection.execute(
+                "UPDATE asi.email_message SET attachments_json = ? WHERE id = ?",
+                json.dumps(attachments, ensure_ascii=False),
+                message_id,
+            )
         connection.execute(
             """
             UPDATE m SET text_body = NULL, html_body = NULL
