@@ -39,7 +39,12 @@ from lark_oapi.ws.model import Response
 
 from app.bootstrap import bootstrap
 from app.builtin_commands import handle_builtin_text_command
-from app.event_dedup import claim_event, finish_event
+from app.event_dedup import (
+    claim_event,
+    finish_event,
+    list_processing_events,
+    record_event_progress,
+)
 from app.email_pop3 import EmailAuthenticationError, EmailConnectionError
 from app.email_service import (
     bind_email_account,
@@ -334,6 +339,7 @@ def run_client_process(app_payload: dict[str, Any]) -> None:
     warnings.filterwarnings("ignore", category=DeprecationWarning)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     install_sensitive_log_filter()
+    asyncio.run(recover_processing_cards(app))
     settings = get_settings()
     worker_count = max(1, settings.feishu_event_workers)
     event_slots = threading.BoundedSemaphore(
@@ -451,6 +457,29 @@ def run_client_process(app_payload: dict[str, Any]) -> None:
     )
     logger.info("Starting Feishu websocket: bot_code=%s app_id=%s", app.bot_code, app.app_id)
     client.start()
+
+
+async def recover_processing_cards(app: TenantApp) -> None:
+    rows = await list_processing_events(tenant_key=app.tenant_key, app_id=app.app_id)
+    for row in rows:
+        card = build_answer_card(
+            str(row.get("request_text") or "上次请求"),
+            "上次处理已因服务重启而中断，请重新发送指令。",
+            status="denied",
+            title="请重新发送",
+        )
+        progress_message_id = str(row.get("progress_message_id") or "")
+        updated = bool(progress_message_id) and await update_card(
+            app, progress_message_id, card
+        )
+        if not updated:
+            await reply_card(app, str(row["message_id"]), card)
+        await finish_event(
+            tenant_key=app.tenant_key,
+            app_id=app.app_id,
+            message_id=str(row["message_id"]),
+            error="service restarted",
+        )
 
 
 def extract_email_bind_card_action(
@@ -706,6 +735,14 @@ async def dispatch_event(app: TenantApp, event: dict[str, Any]) -> None:
     if event.get("message_id"):
         progress_message_id = await reply_card(app, event["message_id"], build_processing_card(event["text"]))
         event["_reply_message_id"] = progress_message_id
+        if progress_message_id:
+            await record_event_progress(
+                tenant_key=event["tenant_key"],
+                app_id=event["app_id"],
+                message_id=event["message_id"],
+                progress_message_id=progress_message_id,
+                request_text=event["text"],
+            )
     try:
         handled = await handle_builtin_text_command(app, event, progress_message_id)
         if handled:

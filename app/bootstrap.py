@@ -140,6 +140,8 @@ CREATE TABLE IF NOT EXISTS processed_event (
   app_id TEXT NOT NULL,
   message_id TEXT NOT NULL,
   status TEXT NOT NULL,
+  progress_message_id TEXT,
+  request_text TEXT,
   last_error TEXT,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL,
@@ -326,6 +328,7 @@ async def bootstrap() -> None:
         await ensure_conversation_session_integrity(db)
         await ensure_uploaded_file_columns(db)
         await ensure_export_context_columns(db)
+        await ensure_processed_event_columns(db)
         await ensure_scheduler_columns(db)
         if get_settings().app_env.lower() in {"dev", "local", "test"}:
             await db.executescript(SAMPLE_SQL)
@@ -410,6 +413,14 @@ async def ensure_export_context_columns(db) -> None:
         )
         """
     )
+
+
+async def ensure_processed_event_columns(db) -> None:
+    cursor = await db.execute("PRAGMA table_info(processed_event)")
+    columns = {row[1] for row in await cursor.fetchall()}
+    for column in ("progress_message_id", "request_text"):
+        if column not in columns:
+            await db.execute(f"ALTER TABLE processed_event ADD COLUMN {column} TEXT")
 
 
 async def ensure_scheduler_columns(db) -> None:

@@ -49,6 +49,7 @@ class Settings(BaseSettings):
     email_pop3_host: str = "mail.asiansha.com"
     email_pop3_port: int = 995
     email_pop3_timeout_seconds: int = 30
+    email_analysis_timeout_seconds: int = 300
     email_initial_lookback_hours: int = 48
     email_initial_max_messages: int = 100
     email_default_retention_days: int = 7

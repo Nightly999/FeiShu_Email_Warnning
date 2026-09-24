@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import time
 
-from app.db import execute, open_db
+from app.db import execute, fetch_all, open_db
 
 
 async def claim_event(
@@ -51,4 +51,39 @@ async def finish_event(
             app_id,
             message_id,
         ),
+    )
+
+
+async def record_event_progress(
+    *, tenant_key: str, app_id: str, message_id: str,
+    progress_message_id: str, request_text: str,
+) -> None:
+    await execute(
+        """
+        UPDATE processed_event
+        SET progress_message_id = ?, request_text = ?, updated_at = ?
+        WHERE tenant_key = ? AND app_id = ? AND message_id = ?
+          AND status = 'processing'
+        """,
+        (
+            progress_message_id,
+            request_text[:500],
+            int(time.time()),
+            tenant_key,
+            app_id,
+            message_id,
+        ),
+    )
+
+
+async def list_processing_events(
+    *, tenant_key: str, app_id: str
+) -> list[dict]:
+    return await fetch_all(
+        """
+        SELECT message_id, progress_message_id, request_text
+        FROM processed_event
+        WHERE tenant_key = ? AND app_id = ? AND status = 'processing'
+        """,
+        (tenant_key, app_id),
     )

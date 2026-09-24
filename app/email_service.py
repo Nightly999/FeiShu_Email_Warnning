@@ -126,15 +126,16 @@ def looks_like_email_request(text: str) -> bool:
 
 
 def is_stop_email_analysis_command(text: str) -> bool:
-    normalized = re.sub(r"\s+", "", text or "")
-    return normalized in {
-        "停止任务",
-        "停止分析",
-        "取消分析",
-        "终止分析",
-        "停止当前分析",
-        "取消当前分析",
-    }
+    normalized = re.sub(r"[\s，。！？、,.!?]+", "", text or "")
+    if any(word in normalized for word in ("定时", "计划", "提醒", "推送")):
+        return False
+    if any(phrase in normalized for phrase in ("不要停止", "别停止", "不要取消")):
+        return False
+    if normalized in {"取消", "取消一下", "停止", "停一下", "算了", "不用了", "别弄了"}:
+        return True
+    action = any(word in normalized for word in ("取消", "停止", "终止", "中止", "暂停", "结束", "别再", "不要再"))
+    target = any(word in normalized for word in ("指令", "分析", "分类", "处理", "整理", "任务", "操作", "请求", "执行", "工作"))
+    return action and target and len(normalized) <= 30
 
 
 def cancel_email_analysis(event: dict[str, Any], command_id: str = "") -> bool:
@@ -161,7 +162,14 @@ async def _run_cancellable_analysis(
     with _analysis_lock:
         _active_analyses[key] = (asyncio.get_running_loop(), task)
     try:
-        return await task
+        return await asyncio.wait_for(
+            task, timeout=get_settings().email_analysis_timeout_seconds
+        )
+    except TimeoutError:
+        return EmailCommandResult(
+            "本次处理的邮件较多，已自动结束。请缩小范围后重新发送，"
+            "例如“分析最近20封有附件的邮件”。"
+        )
     except asyncio.CancelledError:
         return EmailCommandResult("邮件分析已停止。")
     finally:

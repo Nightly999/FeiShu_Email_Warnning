@@ -48,6 +48,7 @@ from app.feishu_ws import (
     extract_email_page_card_action,
     process_email_page_card,
     process_email_bind_card,
+    recover_processing_cards,
 )
 from app.logging_security import redact_sensitive_text
 from app.settings import get_settings
@@ -255,8 +256,60 @@ def test_stop_email_analysis_cancels_only_the_current_user(monkeypatch) -> None:
         assert result.answer == "邮件分析已停止。"
 
     asyncio.run(scenario())
-    assert is_stop_email_analysis_command("停止当前分析") is True
-    assert is_stop_email_analysis_command("停止定时任务") is False
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "取消指令",
+        "取消分析",
+        "取消分类",
+        "停止整理",
+        "终止邮件处理",
+        "暂停当前任务",
+        "结束这次操作",
+        "取消",
+        "算了",
+        "不用了",
+        "别再分析了",
+    ],
+)
+def test_stop_email_analysis_accepts_natural_phrasing(text: str) -> None:
+    assert is_stop_email_analysis_command(text) is True
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "停止定时任务",
+        "取消每天推送",
+        "取消邮箱绑定",
+        "不要停止分析",
+        "分析我的邮件",
+    ],
+)
+def test_stop_email_analysis_keeps_other_commands(text: str) -> None:
+    assert is_stop_email_analysis_command(text) is False
+
+
+def test_email_analysis_timeout_returns_retry_guidance(monkeypatch) -> None:
+    event = {"tenant_key": "tenant", "app_id": "app", "open_id": "user"}
+
+    async def slow_analysis(*_args):
+        await asyncio.sleep(30)
+
+    monkeypatch.setattr("app.email_service.sync_analyze_report", slow_analysis)
+    monkeypatch.setattr(
+        "app.email_service.get_settings",
+        lambda: type("Settings", (), {"email_analysis_timeout_seconds": 0.01})(),
+    )
+
+    result = asyncio.run(
+        _run_cancellable_analysis(event, {}, EmailPlan(action="query"))
+    )
+
+    assert "已自动结束" in result.answer
+    assert "最近20封有附件的邮件" in result.answer
 
 
 def test_text_processing_exception_replaces_progress_card_with_input_guide(monkeypatch) -> None:
@@ -268,6 +321,7 @@ def test_text_processing_exception_replaces_progress_card_with_input_guide(monke
     monkeypatch.setattr(
         "app.feishu_ws.reply_card", AsyncMock(return_value="progress-message")
     )
+    monkeypatch.setattr("app.feishu_ws.record_event_progress", AsyncMock())
     monkeypatch.setattr(
         "app.feishu_ws.handle_builtin_text_command",
         AsyncMock(side_effect=RuntimeError("boom")),
@@ -297,6 +351,42 @@ def test_text_processing_exception_replaces_progress_card_with_input_guide(monke
     assert "每天上午9点分析未处理邮件并推送给我" in content
     assert "失败" not in content
     assert "错误" not in content
+
+
+def test_restart_replaces_stale_processing_card(monkeypatch) -> None:
+    app = TenantApp("tenant", "app", "secret", None, None, "bot", None)
+    monkeypatch.setattr(
+        "app.feishu_ws.list_processing_events",
+        AsyncMock(
+            return_value=[
+                {
+                    "message_id": "request-message",
+                    "progress_message_id": "progress-message",
+                    "request_text": "整理有附件的邮件",
+                }
+            ]
+        ),
+    )
+    update = AsyncMock(return_value=False)
+    reply = AsyncMock()
+    finish = AsyncMock()
+    monkeypatch.setattr("app.feishu_ws.update_card", update)
+    monkeypatch.setattr("app.feishu_ws.reply_card", reply)
+    monkeypatch.setattr("app.feishu_ws.finish_event", finish)
+
+    asyncio.run(recover_processing_cards(app))
+
+    card = update.await_args.args[2]
+    assert update.await_args.args[:2] == (app, "progress-message")
+    assert card["header"]["title"]["content"] == "请重新发送"
+    assert "服务重启而中断" in card["body"]["elements"][0]["content"]
+    reply.assert_awaited_once_with(app, "request-message", card)
+    finish.assert_awaited_once_with(
+        tenant_key="tenant",
+        app_id="app",
+        message_id="request-message",
+        error="service restarted",
+    )
 
 
 def test_explicit_email_login_skips_model_planning(
