@@ -22,6 +22,7 @@ from app.feishu_cards import build_answer_card, build_processing_card, should_us
 from app.graph import run_agent
 from app.logging_security import install_sensitive_log_filter
 from app.memory.sessions import get_active_session_id
+from app.multi_intent import split_multi_intent_commands
 from app.reply_context import hydrate_reply_context
 from app.settings import get_settings
 
@@ -118,39 +119,28 @@ async def feishu_events(
         event["_session_id"] = session_id
         await hydrate_reply_context(tenant_app, event)
         event["_reply_message_id"] = progress_message_id
-        handled = await handle_builtin_text_command(
-            tenant_app, event, progress_message_id
-        )
-        if handled:
-            if message_id:
-                await finish_event(
-                    tenant_key=event["tenant_key"],
-                    app_id=event["app_id"],
-                    message_id=message_id,
-                )
-            return JSONResponse({"status": "ok"})
+        commands = await split_multi_intent_commands(event["text"])
+        for index, command_text in enumerate(commands):
+            child_event = {**event, "text": command_text}
+            child_progress_id = progress_message_id if index == 0 else None
+            handled = await handle_builtin_text_command(
+                tenant_app, child_event, child_progress_id
+            )
+            if handled:
+                continue
 
-        result = await run_agent(event)
-        answer = result.content
-
-        if event.get("message_id"):
-            if should_use_card(answer):
-                answer_card = build_answer_card(event["text"], answer, status=result.status)
-                if progress_message_id:
-                    updated = await update_card(tenant_app, progress_message_id, answer_card)
-                    if not updated:
-                        await reply_card(tenant_app, event["message_id"], answer_card)
-                else:
-                    await reply_card(tenant_app, event["message_id"], answer_card)
-            else:
-                if progress_message_id:
+            result = await run_agent(child_event)
+            answer = result.content
+            if event.get("message_id"):
+                answer_card = build_answer_card(command_text, answer, status=result.status)
+                if child_progress_id:
                     updated = await update_card(
-                        tenant_app,
-                        progress_message_id,
-                        build_answer_card(event["text"], answer, status=result.status),
+                        tenant_app, child_progress_id, answer_card
                     )
                     if not updated:
-                        await reply_message(tenant_app, event["message_id"], answer)
+                        await reply_card(tenant_app, event["message_id"], answer_card)
+                elif should_use_card(answer):
+                    await reply_card(tenant_app, event["message_id"], answer_card)
                 else:
                     await reply_message(tenant_app, event["message_id"], answer)
 

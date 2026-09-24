@@ -328,7 +328,7 @@ class WelcomeMessageTests(unittest.IsolatedAsyncioTestCase):
         restore_environment("APP_ENV", self.previous_app_env)
         self.temp_dir.cleanup()
 
-    async def test_welcome_message_is_sent_once_per_user_per_day(self) -> None:
+    async def test_bound_user_does_not_receive_entry_welcome(self) -> None:
         app = tenant_app()
         event = {
             "tenant_key": app.tenant_key,
@@ -341,15 +341,9 @@ class WelcomeMessageTests(unittest.IsolatedAsyncioTestCase):
             patch("app.welcome.get_email_account", new_callable=AsyncMock, return_value={"id": 1}),
             patch("app.welcome.send_card", new_callable=AsyncMock) as send_card,
         ):
-            send_card.return_value = "om_welcome"
-            self.assertTrue(await send_daily_welcome_once(app, event))
             self.assertFalse(await send_daily_welcome_once(app, event))
 
-        self.assertEqual(send_card.await_count, 1)
-        card = send_card.await_args.args[2]
-        self.assertEqual(card["schema"], "2.0")
-        self.assertEqual(card["header"]["title"]["content"], "来邮速递｜AI 邮件助手 📬")
-        self.assertIn("查询与分析", str(card))
+        send_card.assert_not_awaited()
 
     async def test_welcome_message_retries_after_send_failure(self) -> None:
         app = tenant_app()

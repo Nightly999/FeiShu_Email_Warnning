@@ -53,6 +53,31 @@ class SchedulePlannerToolTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(arguments["daily_times"], ["10:00", "21:00"])
 
+    def test_tool_call_weekday_list_string_is_decoded(self) -> None:
+        response = type(
+            "Response",
+            (),
+            {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "name": "plan_scheduled_task",
+                        "args": {
+                            "action": "create",
+                            "schedule_type": "weekly_multi",
+                            "weekly_days": "[0, 1, 2, 3, 4]",
+                            "daily_time": "17:30",
+                            "prompt": "分析我的邮件并推送给我",
+                        },
+                    }
+                ],
+            },
+        )()
+
+        arguments = extract_schedule_plan_arguments(response)
+
+        self.assertEqual(arguments["weekly_days"], [0, 1, 2, 3, 4])
+
     def test_mimo_text_encoded_tool_call_is_supported(self) -> None:
         response = type(
             "Response",

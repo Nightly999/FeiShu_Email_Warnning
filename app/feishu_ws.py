@@ -72,6 +72,7 @@ from app.file_analysis import safe_resource_path
 from app.graph import run_agent
 from app.logging_security import install_sensitive_log_filter
 from app.memory.sessions import get_active_session_id
+from app.multi_intent import split_multi_intent_commands
 from app.reply_context import hydrate_reply_context
 from app.scheduler import start_scheduler_thread
 from app.settings import get_settings
@@ -744,29 +745,23 @@ async def dispatch_event(app: TenantApp, event: dict[str, Any]) -> None:
                 request_text=event["text"],
             )
     try:
-        handled = await handle_builtin_text_command(app, event, progress_message_id)
-        if handled:
-            return
-        result = await run_agent(event)
-        answer = result.content
-        if event.get("message_id"):
-            if should_use_card(answer):
-                answer_card = build_answer_card(event["text"], answer, status=result.status)
-                if progress_message_id:
-                    updated = await update_card(app, progress_message_id, answer_card)
+        commands = await split_multi_intent_commands(event["text"])
+        for index, command_text in enumerate(commands):
+            child_event = {**event, "text": command_text}
+            child_progress_id = progress_message_id if index == 0 else None
+            handled = await handle_builtin_text_command(app, child_event, child_progress_id)
+            if handled:
+                continue
+            result = await run_agent(child_event)
+            answer = result.content
+            if event.get("message_id"):
+                answer_card = build_answer_card(command_text, answer, status=result.status)
+                if child_progress_id:
+                    updated = await update_card(app, child_progress_id, answer_card)
                     if not updated:
                         await reply_card(app, event["message_id"], answer_card)
-                else:
+                elif should_use_card(answer):
                     await reply_card(app, event["message_id"], answer_card)
-            else:
-                if progress_message_id:
-                    updated = await update_card(
-                        app,
-                        progress_message_id,
-                        build_answer_card(event["text"], answer, status=result.status),
-                    )
-                    if not updated:
-                        await reply_message(app, event["message_id"], answer)
                 else:
                     await reply_message(app, event["message_id"], answer)
     except Exception:

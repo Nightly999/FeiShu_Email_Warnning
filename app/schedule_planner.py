@@ -34,6 +34,7 @@ SCHEDULE_PLAN_FIELDS = {
     "daily_time",
     "daily_times",
     "weekly_day",
+    "weekly_days",
     "interval_minutes",
     "prompt",
     "execution_mode",
@@ -55,11 +56,14 @@ class SchedulePlan(BaseModel):
     ]
     task_id: int | None = None
     page: int | None = None
-    schedule_type: Literal["once", "daily", "daily_multi", "weekly", "interval"] | None = None
+    schedule_type: Literal[
+        "once", "daily", "daily_multi", "weekly", "weekly_multi", "interval"
+    ] | None = None
     run_at: str | None = None
     daily_time: str | None = None
     daily_times: list[str] | None = None
     weekly_day: int | None = None
+    weekly_days: list[int] | None = None
     interval_minutes: int | None = None
     prompt: str = ""
     execution_mode: Literal["agent", "reminder"] | None = None
@@ -86,7 +90,10 @@ SCHEDULE_TOOL = {
                 "page": {"type": ["integer", "null"]},
                 "schedule_type": {
                     "type": ["string", "null"],
-                    "enum": ["once", "daily", "daily_multi", "weekly", "interval", None],
+                    "enum": [
+                        "once", "daily", "daily_multi", "weekly", "weekly_multi",
+                        "interval", None,
+                    ],
                 },
                 "run_at": {"type": ["string", "null"]},
                 "daily_time": {"type": ["string", "null"]},
@@ -95,6 +102,10 @@ SCHEDULE_TOOL = {
                     "items": {"type": "string"},
                 },
                 "weekly_day": {"type": ["integer", "null"]},
+                "weekly_days": {
+                    "type": ["array", "null"],
+                    "items": {"type": "integer"},
+                },
                 "interval_minutes": {"type": ["integer", "null"]},
                 "prompt": {"type": "string"},
                 "execution_mode": {
@@ -113,6 +124,7 @@ SCHEDULE_TOOL = {
                 "daily_time",
                 "daily_times",
                 "weekly_day",
+                "weekly_days",
                 "interval_minutes",
                 "prompt",
                 "execution_mode",
@@ -132,7 +144,7 @@ SCHEDULE_PLANNER_PROMPT = """
 1. 先识别用户要创建还是管理定时任务。查询、列出、有几个、有哪些任务使用 list；查看执行记录使用 history；清除、清空、取消或删除全部任务使用 cancel_all；删除、暂停、恢复、立即执行分别使用 cancel、pause、resume、run_now。不能确定是全部还是单个时 action=clarify。
 2. 管理单个任务时提取 task_id；list 和 history 可提取 page。缺少必需的任务编号时 action=clarify，只询问编号。
 3. 创建任务时从原始请求中提取执行时间和任务目标，不要生成代码、SQL 或 MCP 工具名。
-4. daily 使用 24 小时制 HH:MM；一天多个时间使用 daily_multi，并把所有 HH:MM 放入 daily_times；“早八点半和晚五点二十”是 08:30、17:20；每周/每星期使用 weekly，weekly_day 按周一=0至周日=6，时间放入 daily_time；once 使用 YYYY-MM-DD HH:MM；interval 使用整数分钟。
+4. daily 使用 24 小时制 HH:MM；一天多个时间使用 daily_multi，并把所有 HH:MM 放入 daily_times；“早八点半和晚五点二十”是 08:30、17:20；单个星期使用 weekly，weekly_day 按周一=0至周日=6；“工作日”“周一到周五”或多个星期使用 weekly_multi，把星期放入 weekly_days，时间放入 daily_time；once 使用 YYYY-MM-DD HH:MM；interval 使用整数分钟。
 5. 需要届时查询、分析或汇总业务系统真实数据的任务使用 agent。只发送固定提醒文字的任务使用 reminder。
 6. “查询预计日期前三天仍未完成并通知我”属于 agent，而“提醒我提交日报”属于 reminder。
 7. prompt 保存届时交给 Agent 或提醒器的完整目标，删除“创建定时任务”“开始执行内容是”等外层措辞。
@@ -217,11 +229,13 @@ def extract_schedule_plan_arguments(response: Any) -> dict[str, Any]:
 
 
 def _normalize_schedule_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
-    daily_times = arguments.get("daily_times")
-    if not isinstance(daily_times, str):
-        return arguments
-    try:
-        parsed = json.loads(daily_times)
-    except json.JSONDecodeError:
-        parsed = [item.strip() for item in daily_times.split(",") if item.strip()]
-    return {**arguments, "daily_times": parsed}
+    normalized = dict(arguments)
+    for name in ("daily_times", "weekly_days"):
+        value = normalized.get(name)
+        if not isinstance(value, str):
+            continue
+        try:
+            normalized[name] = json.loads(value)
+        except json.JSONDecodeError:
+            normalized[name] = [item.strip() for item in value.split(",") if item.strip()]
+    return normalized

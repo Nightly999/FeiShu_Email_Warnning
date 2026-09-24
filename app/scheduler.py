@@ -76,23 +76,23 @@ def parse_schedule_command(text: str) -> dict[str, str] | None:
         (
             "cancel",
             r"^(?:取消|删除|删掉|移除)\s*(?:定时任务\s*)?(?:#|第)?\s*(\d+)"
-            r"\s*(?:号|个)?\s*(?:定时任务)?$",
+            r"\s*(?:号|个)?\s*(?:(?:的\s*)?(?:定时)?任务)?$",
         ),
         (
             "pause",
             r"^(?:暂停|停用|停止|关掉)\s*(?:定时任务\s*)?(?:#|第)?\s*(\d+)"
-            r"\s*(?:号|个)?\s*(?:定时任务)?$",
+            r"\s*(?:号|个)?\s*(?:(?:的\s*)?(?:定时)?任务)?$",
         ),
         (
             "resume",
             r"^(?:恢复|启用|开启|打开)\s*(?:定时任务\s*)?(?:#|第)?\s*(\d+)"
-            r"\s*(?:号|个)?\s*(?:定时任务)?$",
+            r"\s*(?:号|个)?\s*(?:(?:的\s*)?(?:定时)?任务)?$",
         ),
         (
             "run_now",
             r"^(?:立即执行|马上执行|执行|运行)\s*(?:定时任务\s*)?"
             r"(?:#|第)?\s*(\d+)"
-            r"\s*(?:号|个)?\s*(?:定时任务)?$",
+            r"\s*(?:号|个)?\s*(?:(?:的\s*)?(?:定时)?任务)?$",
         ),
     )
     for action, pattern in management_patterns:
@@ -126,14 +126,59 @@ def parse_schedule_command(text: str) -> dict[str, str] | None:
         text,
     )
 
+    weekday_range = re.match(
+        r"^(?:请\s*)?(?:帮我\s*)?(?:每天\s*)?(?:每(?:个)?\s*)?"
+        r"(?:周|星期|礼拜)\s*"
+        r"([一二三四五六日天1-7])\s*(?:到|至|[-~—])\s*"
+        r"(?:(?:周|星期|礼拜)\s*)?([一二三四五六日天1-7])\s*(.+)$",
+        schedule_text,
+        re.S,
+    )
+    workday = re.match(
+        r"^(?:请\s*)?(?:帮我\s*)?(?:每(?:个)?工作日|工作日)\s*(.+)$",
+        schedule_text,
+        re.S,
+    )
+    if weekday_range or workday:
+        if workday:
+            weekly_days = list(range(5))
+            weekly_body = workday.group(1)
+        else:
+            first = weekday_index(weekday_range.group(1))
+            last = weekday_index(weekday_range.group(2))
+            if first > last:
+                return invalid_time_command("星期范围必须按先后顺序，例如“周一到周五”。")
+            weekly_days = list(range(first, last + 1))
+            weekly_body = weekday_range.group(3)
+        weekly_text = "每天 " + weekly_body
+        if ambiguous_daily_clocks(weekly_text):
+            return ambiguous_time_command()
+        try:
+            weekly_plan = parse_natural_daily_command(weekly_text)
+        except ValueError:
+            return invalid_time_command("时间无效，请使用例如“工作日 17:30”。")
+        if weekly_plan and len(weekly_plan[0]) == 1:
+            prompt, inline_name = extract_inline_task_name(weekly_plan[1])
+            command = {
+                "schedule_type": "weekly_multi",
+                "weekly_days": ",".join(str(day) for day in weekly_days),
+                "daily_time": weekly_plan[0][0],
+                "prompt": prompt,
+            }
+            if explicit_name or inline_name:
+                command["task_name"] = explicit_name or inline_name
+            if explicit_mode:
+                command["execution_mode"] = explicit_mode
+            return command
+        return invalid_time_command("请提供一个具体执行时间，例如“工作日 17:30”。")
+
     weekly = re.match(
         r"^每(?:个)?(?:周|星期|礼拜)\s*([一二三四五六日天1-7])\s*(.+)$",
         schedule_text,
         re.S,
     )
     if weekly:
-        day = weekly.group(1)
-        weekly_day = 6 if day == "天" else int(day) - 1 if day.isdigit() else WEEKDAY_NAMES.index(day)
+        weekly_day = weekday_index(weekly.group(1))
         weekly_text = "每天 " + weekly.group(2)
         if ambiguous_daily_clocks(weekly_text):
             return ambiguous_time_command()
@@ -281,6 +326,7 @@ def parse_natural_daily_command(text: str) -> tuple[list[str], str] | None:
             break
         position = next_position
     prompt = text[position:].strip(" ，,。；;：:")
+    prompt = re.sub(r"^定时(?:执行)?\s*", "", prompt).strip()
     if not prompt:
         return None
     return list(dict.fromkeys(times)), prompt
@@ -343,6 +389,8 @@ async def resolve_schedule_command(
     }
     if command and command.get("schedule_type") in management_types:
         return command
+    if command and command.get("schedule_type") == "weekly_multi":
+        return command
     if command and command.get("schedule_type") == "invalid" and not is_schedule_management_intent(text):
         return command
 
@@ -351,9 +399,13 @@ async def resolve_schedule_command(
         referenced_message_text
     ):
         original_request = referenced_message_text
+    if original_request and is_schedule_confirmation_reply(text):
+        confirmed = parse_schedule_command(original_request)
+        if confirmed and confirmed.get("schedule_type") not in {"help", "invalid"}:
+            return confirmed
     should_plan = bool(
         is_schedule_creation_intent(text)
-        or (command and command.get("schedule_type") in {"help", "once", "daily", "daily_multi", "weekly", "interval"})
+        or (command and command.get("schedule_type") in {"help", "once", "daily", "daily_multi", "weekly", "weekly_multi", "interval"})
         or (original_request and is_schedule_followup_reply(text))
         or is_schedule_management_intent(text)
         or (
@@ -386,6 +438,7 @@ async def resolve_schedule_command(
                 "daily": ("daily_time",),
                 "daily_multi": ("daily_times",),
                 "weekly": ("weekly_day", "daily_time"),
+                "weekly_multi": ("weekly_days", "daily_time"),
                 "interval": ("interval_minutes",),
                 "once": ("run_at",) if re.search(r"\d{4}-\d{2}-\d{2}", text) else (),
             }.get(command.get("schedule_type"))
@@ -448,6 +501,14 @@ def schedule_plan_to_command(plan: SchedulePlan) -> dict[str, str]:
                 raise ValueError
             command["weekly_day"] = str(plan.weekly_day)
             command["daily_time"] = normalize_time(plan.daily_time.replace("：", ":"))
+        elif plan.schedule_type == "weekly_multi":
+            if not plan.weekly_days or not plan.daily_time:
+                raise ValueError
+            weekly_days = list(dict.fromkeys(plan.weekly_days))
+            if any(day < 0 or day > 6 for day in weekly_days):
+                raise ValueError
+            command["weekly_days"] = ",".join(str(day) for day in weekly_days)
+            command["daily_time"] = normalize_time(plan.daily_time.replace("：", ":"))
         elif plan.schedule_type == "daily_multi":
             if not plan.daily_times:
                 raise ValueError
@@ -478,7 +539,7 @@ def is_execution_mode_reply(text: str) -> bool:
 
 def is_schedule_followup_reply(text: str) -> bool:
     value = (text or "").strip()
-    if is_execution_mode_reply(value):
+    if is_execution_mode_reply(value) or is_schedule_confirmation_reply(value):
         return True
     if len(value) > 80:
         return False
@@ -490,6 +551,14 @@ def is_schedule_followup_reply(text: str) -> bool:
             for word in ("上午", "下午", "早上", "晚上", "具体时间", "执行时间")
         )
     )
+
+
+def is_schedule_confirmation_reply(text: str) -> bool:
+    normalized = re.sub(r"[\s，,。.!！]+", "", (text or "")).casefold()
+    return normalized in {
+        "可以", "确认", "好的", "好", "是", "对", "同意", "没问题",
+        "就这样", "按这个", "按此执行", "确认执行",
+    }
 
 
 def extract_outer_task_name(text: str) -> tuple[str | None, str]:
@@ -631,6 +700,20 @@ def is_schedule_management_intent(text: str) -> bool:
 
 def invalid_time_command(message: str) -> dict[str, str]:
     return {"schedule_type": "invalid", "error": message}
+
+
+def weekday_index(value: str) -> int:
+    if value == "天":
+        return 6
+    return int(value) - 1 if value.isdigit() else WEEKDAY_NAMES.index(value)
+
+
+def weekly_days_text(value: str) -> str:
+    days = [int(day) for day in value.split(",")]
+    names = [WEEKDAY_NAMES[day] for day in days]
+    if days == list(range(days[0], days[-1] + 1)):
+        return f"每周{names[0]}至周{names[-1]}"
+    return "每周" + "、周".join(names)
 
 
 async def handle_schedule_command(app: TenantApp, event: dict[str, Any], command: dict[str, str]) -> str:
@@ -833,6 +916,10 @@ async def create_scheduled_task(app: TenantApp, event: dict[str, Any], command: 
         next_run_at = scheduler_runtime.next_daily_run(command["daily_time"])
     elif command["schedule_type"] == "weekly":
         next_run_at = scheduler_runtime.next_weekly_run(int(command["weekly_day"]), command["daily_time"])
+    elif command["schedule_type"] == "weekly_multi":
+        next_run_at = scheduler_runtime.next_weekly_days_run(
+            command["weekly_days"], command["daily_time"]
+        )
     elif command["schedule_type"] == "interval":
         next_run_at = scheduler_runtime.next_interval_run(
             int(command["interval_minutes"])
@@ -858,7 +945,7 @@ async def create_scheduled_task(app: TenantApp, event: dict[str, Any], command: 
                 command["schedule_type"],
                 command.get("run_at"),
                 command.get("daily_time"),
-                command.get("weekly_day"),
+                command.get("weekly_day") or command.get("weekly_days"),
                 command.get("interval_minutes"),
                 prompt,
                 next_run_at,
@@ -869,11 +956,12 @@ async def create_scheduled_task(app: TenantApp, event: dict[str, Any], command: 
             ),
         )
         task_id = int(cur.lastrowid)
-    mode_label = "自动执行 Agent 查询" if execution_mode == "agent" else "发送提醒"
     if command["schedule_type"] == "daily":
         schedule = f"每天 {command['daily_time']}"
     elif command["schedule_type"] == "weekly":
         schedule = f"每周{WEEKDAY_NAMES[int(command['weekly_day'])]} {command['daily_time']}"
+    elif command["schedule_type"] == "weekly_multi":
+        schedule = f"{weekly_days_text(command['weekly_days'])} {command['daily_time']}"
     elif command["schedule_type"] == "interval":
         schedule = interval_schedule_text(int(command["interval_minutes"]))
     else:
@@ -935,6 +1023,8 @@ async def list_scheduled_tasks(
             schedule = f"每天 {row['daily_time']}"
         elif row["schedule_type"] == "weekly":
             schedule = f"每周{WEEKDAY_NAMES[int(row['weekly_day'])]} {row['daily_time']}"
+        elif row["schedule_type"] == "weekly_multi":
+            schedule = f"{weekly_days_text(str(row['weekly_day']))} {row['daily_time']}"
         elif row["schedule_type"] == "interval":
             schedule = interval_schedule_text(int(row["interval_minutes"]))
         else:
@@ -993,6 +1083,10 @@ async def manage_scheduled_task(
             next_run_at = scheduler_runtime.next_daily_run(task["daily_time"])
         elif task["schedule_type"] == "weekly":
             next_run_at = scheduler_runtime.next_weekly_run(int(task["weekly_day"]), task["daily_time"])
+        elif task["schedule_type"] == "weekly_multi":
+            next_run_at = scheduler_runtime.next_weekly_days_run(
+                str(task["weekly_day"]), task["daily_time"]
+            )
         elif task["schedule_type"] == "interval":
             next_run_at = scheduler_runtime.next_interval_run(
                 int(task["interval_minutes"])

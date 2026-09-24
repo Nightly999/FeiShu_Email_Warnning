@@ -21,7 +21,7 @@ from app.scheduler import (
     manage_scheduled_task,
     scheduled_task_history,
 )
-from app.scheduler_runtime import next_weekly_run, run_due_tasks
+from app.scheduler_runtime import next_weekly_days_run, next_weekly_run, run_due_tasks
 from app.memory.repository import add_conversation_turn
 from app.settings import get_settings
 
@@ -46,6 +46,13 @@ class SchedulerRuntimeTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(next_weekly_run(4, "17:30"), "2026-09-25 17:30:00")
         with patch("app.scheduler_runtime.now_datetime", return_value=datetime(2026, 9, 20, 10, 0)):
             self.assertEqual(next_weekly_run(0, "09:00"), "2026-09-21 09:00:00")
+
+    def test_next_weekday_run_skips_weekend(self) -> None:
+        with patch("app.scheduler_runtime.now_datetime", return_value=datetime(2026, 9, 18, 17, 30)):
+            self.assertEqual(
+                next_weekly_days_run("0,1,2,3,4", "17:30"),
+                "2026-09-21 17:30:00",
+            )
 
     async def asyncSetUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory(dir=Path.cwd())
@@ -168,6 +175,44 @@ class SchedulerRuntimeTests(unittest.IsolatedAsyncioTestCase):
         task = await fetch_one("SELECT * FROM scheduled_task WHERE id = ?", (task["id"],))
         self.assertEqual(task["enabled"], 1)
         self.assertEqual(task["next_run_at"], next_weekly_run(4, "17:30"))
+
+    async def test_weekday_range_is_stored_as_one_recurring_task(self) -> None:
+        event = {
+            "tenant_key": "tenant", "app_id": "app", "open_id": "user",
+            "chat_id": "chat", "chat_type": "p2p",
+        }
+        answer = await create_scheduled_task(
+            tenant_app(), event,
+            {
+                "schedule_type": "weekly_multi",
+                "weekly_days": "0,1,2,3,4",
+                "daily_time": "17:30",
+                "prompt": "分析我的邮件并推送给我",
+            },
+        )
+        task = await fetch_one("SELECT * FROM scheduled_task")
+
+        self.assertIn("每周一至周五 17:30", answer)
+        self.assertEqual(task["schedule_type"], "weekly_multi")
+        self.assertEqual(task["weekly_day"], "0,1,2,3,4")
+        self.assertEqual(
+            task["next_run_at"], next_weekly_days_run("0,1,2,3,4", "17:30")
+        )
+        self.assertIn(
+            "每周一至周五 17:30", await list_scheduled_tasks(tenant_app(), event)
+        )
+
+        await execute("UPDATE scheduled_task SET next_run_at = '2000-01-01 00:00:00' WHERE id = ?", (task["id"],))
+        with (
+            patch("app.email_service.handle_email_command", AsyncMock(return_value=EmailCommandResult("完成"))),
+            patch("app.scheduler_runtime.send_card", AsyncMock(return_value="message-id")),
+        ):
+            await run_due_tasks({"app": tenant_app()})
+        task = await fetch_one("SELECT * FROM scheduled_task WHERE id = ?", (task["id"],))
+        self.assertEqual(task["enabled"], 1)
+        self.assertEqual(
+            task["next_run_at"], next_weekly_days_run("0,1,2,3,4", "17:30")
+        )
 
     async def test_cancel_all_only_affects_current_user_scope(self) -> None:
         own_first = await self.insert_due_task(execution_mode="agent")
@@ -395,7 +440,7 @@ class SchedulerRuntimeTests(unittest.IsolatedAsyncioTestCase):
     async def test_scheduled_email_delivers_email_briefing_card(self) -> None:
         await self.insert_due_task(
             execution_mode="agent",
-            prompt="分析最近三天的前五封未处理邮件",
+            prompt="定时分析最近三天的前五封未处理邮件",
         )
         email_card = {
             "schema": "2.0",
@@ -403,16 +448,20 @@ class SchedulerRuntimeTests(unittest.IsolatedAsyncioTestCase):
             "body": {"elements": []},
         }
         delivery = AsyncMock(return_value="message-id")
+        email_handler = AsyncMock(
+            return_value=EmailCommandResult("邮件分析", card=email_card)
+        )
 
         with (
-            patch(
-                "app.email_service.handle_email_command",
-                AsyncMock(return_value=EmailCommandResult("邮件分析", card=email_card)),
-            ),
+            patch("app.email_service.handle_email_command", email_handler),
             patch("app.scheduler_runtime.send_card", delivery),
         ):
             await run_due_tasks({"app": tenant_app()})
 
+        self.assertEqual(
+            email_handler.await_args.args[0]["text"],
+            "分析最近三天的前五封未处理邮件",
+        )
         self.assertIs(delivery.await_args.args[2], email_card)
 
     async def test_interval_agent_remains_enabled_after_success(self) -> None:

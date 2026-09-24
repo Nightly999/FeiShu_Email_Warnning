@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -98,6 +99,7 @@ async def execute_task_payload(
     if task.get("execution_mode") != "agent":
         return f"定时提醒：{task['prompt']}"
 
+    prompt = re.sub(r"^定时(?:执行)?\s*", "", str(task["prompt"])).strip()
     event = {
         "tenant_key": task["tenant_key"],
         "app_id": task["app_id"],
@@ -105,7 +107,7 @@ async def execute_task_payload(
         "chat_id": task["chat_id"],
         "open_id": task["open_id"],
         "message_id": f"scheduled:{task['id']}:{run_id}",
-        "text": task["prompt"],
+        "text": prompt,
         "chat_type": task.get("chat_type") or "group",
         "_session_id": f"automation:{task['id']}:{run_id}",
         "_automation_run": True,
@@ -239,11 +241,13 @@ async def complete_task_run(run_id: str, output: str) -> None:
 
 async def mark_task_success(task: dict[str, Any], run_id: str) -> None:
     now = now_text()
-    if task["schedule_type"] in {"daily", "weekly", "interval"}:
+    if task["schedule_type"] in {"daily", "weekly", "weekly_multi", "interval"}:
         if task["schedule_type"] == "daily":
             next_run_at = next_daily_run(task["daily_time"])
         elif task["schedule_type"] == "weekly":
             next_run_at = next_weekly_run(int(task["weekly_day"]), task["daily_time"])
+        elif task["schedule_type"] == "weekly_multi":
+            next_run_at = next_weekly_days_run(str(task["weekly_day"]), task["daily_time"])
         else:
             next_run_at = next_interval_run(int(task["interval_minutes"]))
         await execute(
@@ -369,6 +373,21 @@ def next_weekly_run(weekly_day: int, daily_time: str) -> str:
     if run_at <= now:
         run_at += timedelta(days=7)
     return run_at.strftime(DB_DATETIME_FORMAT)
+
+
+def next_weekly_days_run(weekly_days: str, daily_time: str) -> str:
+    days = {int(day) for day in weekly_days.split(",")}
+    if not days or any(day < 0 or day > 6 for day in days):
+        raise ValueError("weekly_days must contain values from 0 to 6")
+    hour, minute = [int(part) for part in daily_time.split(":")]
+    now = now_datetime()
+    for offset in range(8):
+        run_at = (now + timedelta(days=offset)).replace(
+            hour=hour, minute=minute, second=0, microsecond=0
+        )
+        if run_at.weekday() in days and run_at > now:
+            return run_at.strftime(DB_DATETIME_FORMAT)
+    raise ValueError("weekly_days did not produce a next run")
 
 
 def next_interval_run(interval_minutes: int) -> str:
