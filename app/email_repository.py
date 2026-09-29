@@ -270,7 +270,9 @@ async def update_sync_result(account_id: int, error: str | None = None) -> None:
     )
 
 
-async def list_recent_messages(account_id: int, lookback_hours: int, limit: int = 100) -> list[dict[str, Any]]:
+async def list_recent_messages(
+    account_id: int, lookback_hours: int, limit: int | None = None
+) -> list[dict[str, Any]]:
     return await _run(_list_recent_messages, account_id, lookback_hours, limit)
 
 
@@ -295,7 +297,7 @@ def _search_messages(
         params.append(subject)
     with _open_connection() as connection:
         cursor = connection.execute(
-            "SELECT TOP 20 m.id, m.sent_at, m.sender_name, m.sender_address, m.subject "
+            "SELECT m.id, m.sent_at, m.sender_name, m.sender_address, m.subject "
             "FROM asi.email_message m WHERE " + " AND ".join(clauses) +
             " ORDER BY m.sent_at DESC, m.id DESC",
             *params,
@@ -338,12 +340,15 @@ def _count_recent_messages(account_id: int, lookback_hours: int) -> int:
         return int(row[0])
 
 
-def _list_recent_messages(account_id: int, lookback_hours: int, limit: int) -> list[dict[str, Any]]:
+def _list_recent_messages(
+    account_id: int, lookback_hours: int, limit: int | None
+) -> list[dict[str, Any]]:
     cutoff = datetime.utcnow() - timedelta(hours=max(1, lookback_hours))
+    top = f"TOP {max(1, limit)} " if limit is not None else ""
     with _open_connection() as connection:
         cursor = connection.execute(
             f"""
-            SELECT TOP {max(1, min(limit, 100))}
+            SELECT {top}
                 m.*, a.summary, a.importance, a.requires_attention, a.relation_type,
                 a.todos_json, a.possible_owner, a.deadline, a.risks_json
             FROM asi.email_message m
@@ -485,7 +490,7 @@ def _finalize_push_logs(run_ref: str, success: bool, error: str | None) -> None:
             UPDATE m SET push_status = ?, push_failed_reason = ?
             FROM asi.email_message m
             JOIN asi.email_push_log p ON p.email_message_id = m.id
-            WHERE p.run_ref = ?
+            WHERE p.run_ref = ? AND p.push_type <> N'search'
             """,
             status,
             error,

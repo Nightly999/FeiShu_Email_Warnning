@@ -125,6 +125,7 @@ def parse_schedule_command(text: str) -> dict[str, str] | None:
         "",
         text,
     )
+    schedule_text = normalize_schedule_clause_order(schedule_text)
 
     weekday_range = re.match(
         r"^(?:请\s*)?(?:帮我\s*)?(?:每天\s*)?(?:每(?:个)?\s*)?"
@@ -310,6 +311,8 @@ def parse_natural_daily_command(text: str) -> tuple[list[str], str] | None:
         period = clock_match.group(1) or ""
         if period in {"午后", "下午", "傍晚", "晚上", "晚间", "夜里", "夜间", "晚"} and 1 <= hour < 12:
             hour += 12
+        elif not period and not clock_match.group(3) and hour == 5:
+            hour = 17
         elif period == "中午" and 1 <= hour <= 6:
             hour += 12
         elif period in {"凌晨", "半夜"} and hour == 12:
@@ -318,7 +321,7 @@ def parse_natural_daily_command(text: str) -> tuple[list[str], str] | None:
             hour = 0
         times.append(normalize_time(f"{hour}:{minute:02d}"))
         position = clock_match.end()
-        connector = re.match(r"\s*(?:和|、|,|，)\s*", text[position:])
+        connector = re.match(r"\s*(?:和|与|、|,|，)\s*", text[position:])
         if not connector:
             break
         next_position = position + connector.end()
@@ -326,10 +329,46 @@ def parse_natural_daily_command(text: str) -> tuple[list[str], str] | None:
             break
         position = next_position
     prompt = text[position:].strip(" ，,。；;：:")
-    prompt = re.sub(r"^定时(?:执行)?\s*", "", prompt).strip()
+    prompt = re.sub(
+        r"^(?:定时(?:执行)?|开始执行(?:内容)?(?:是)?)\s*[：:]?\s*", "", prompt
+    ).strip()
     if not prompt:
         return None
     return list(dict.fromkeys(times)), prompt
+
+
+def normalize_schedule_clause_order(text: str) -> str:
+    """Move an embedded recurring time before its action for deterministic parsing."""
+    if not any(word in text for word in ("推送", "提醒", "通知", "发送", "发给", "执行", "运行", "定时")):
+        return text
+    period = re.search(
+        r"(?:每天\s*)?(?:每(?:个)?\s*)?(?:周|星期|礼拜)\s*[一二三四五六日天1-7]"
+        r"\s*(?:到|至|[-~—])\s*(?:(?:周|星期|礼拜)\s*)?[一二三四五六日天1-7]"
+        r"|(?:每(?:个)?工作日|工作日)|每天|每(?:个)?(?:周|星期|礼拜)\s*[一二三四五六日天1-7]",
+        text,
+    )
+    if not period or period.start() == 0:
+        return text
+    clock = CLOCK_PATTERN.match(text, period.end())
+    if not clock:
+        return text
+    clock_end = clock.end()
+    while connector := re.match(r"\s*(?:和|与|、|,|，)\s*", text[clock_end:]):
+        next_clock = CLOCK_PATTERN.match(text, clock_end + connector.end())
+        if not next_clock:
+            break
+        clock_end = next_clock.end()
+    suffix = text[clock_end:].strip(" ，,。；;：:")
+    if re.match(r"^(?:前|之前|以前|收到|接收)", suffix):
+        return text
+    prefix = re.sub(
+        r"^(?:请\s*)?(?:帮我\s*)?(?:(?:设置|创建|新增)\s*(?:一个)?)?",
+        "",
+        text[:period.start()],
+    )
+    prefix = re.sub(r"[\s，,]*(?:在|于)\s*$", "", prefix).strip(" ，,。；;：:")
+    prompt = "，".join(part for part in (prefix, suffix) if part)
+    return text[period.start():clock_end] + prompt
 
 
 def ambiguous_daily_clocks(text: str) -> list[str]:
@@ -353,10 +392,11 @@ def ambiguous_daily_clocks(text: str) -> list[str]:
             and hour is not None
             and minute is not None
             and 1 <= hour <= 12
+            and hour not in {5, 9}
         ):
             ambiguous.append(f"{hour:02d}:{minute:02d}")
         position = clock_match.end()
-        connector = re.match(r"\s*(?:和|、|,|，)\s*", text[position:])
+        connector = re.match(r"\s*(?:和|与|、|,|，)\s*", text[position:])
         if not connector:
             break
         next_position = position + connector.end()
@@ -384,14 +424,10 @@ async def resolve_schedule_command(
     referenced_request_text: str | None = None,
 ) -> dict[str, str] | None:
     command = parse_schedule_command(text)
-    management_types = {
-        "list", "history", "cancel_all", "cancel", "pause", "resume", "run_now"
-    }
-    if command and command.get("schedule_type") in management_types:
-        return command
-    if command and command.get("schedule_type") == "weekly_multi":
-        return command
-    if command and command.get("schedule_type") == "invalid" and not is_schedule_management_intent(text):
+    if command and command.get("schedule_type") != "help" and not (
+        command.get("schedule_type") == "invalid"
+        and is_schedule_management_intent(text)
+    ):
         return command
 
     original_request = referenced_request_text or ""
@@ -405,7 +441,7 @@ async def resolve_schedule_command(
             return confirmed
     should_plan = bool(
         is_schedule_creation_intent(text)
-        or (command and command.get("schedule_type") in {"help", "once", "daily", "daily_multi", "weekly", "weekly_multi", "interval"})
+        or command is not None
         or (original_request and is_schedule_followup_reply(text))
         or is_schedule_management_intent(text)
         or (
@@ -426,33 +462,8 @@ async def resolve_schedule_command(
             text,
             original_request=original_request or None,
         )
-        planned = schedule_plan_to_command(plan)
-        if command and planned.get("schedule_type") != "invalid":
-            if (
-                looks_like_email_schedule(command.get("prompt", ""))
-                and "分析" in command.get("prompt", "")
-                and planned.get("execution_mode") == "reminder"
-            ):
-                return invalid_time_command("邮件分析必须使用自动执行模式，模型识别为提醒模式，请重新确认。")
-            explicit_fields = {
-                "daily": ("daily_time",),
-                "daily_multi": ("daily_times",),
-                "weekly": ("weekly_day", "daily_time"),
-                "weekly_multi": ("weekly_days", "daily_time"),
-                "interval": ("interval_minutes",),
-                "once": ("run_at",) if re.search(r"\d{4}-\d{2}-\d{2}", text) else (),
-            }.get(command.get("schedule_type"))
-            if explicit_fields is not None and (
-                planned.get("schedule_type") != command["schedule_type"]
-                or any(planned.get(key) != command.get(key) for key in explicit_fields)
-            ):
-                logger.warning("Schedule model disagreed with explicit time; rejecting command")
-                return invalid_time_command("模型识别的执行时间与原指令不一致，请重新确认时间后再发送。")
-        return planned
+        return schedule_plan_to_command(plan)
     except SchedulePlanError as exc:
-        if command and command.get("schedule_type") != "help":
-            logger.warning("Schedule planning failed; using deterministic command: %s", exc)
-            return command
         result = invalid_time_command(str(exc))
         if looks_like_email_schedule(text):
             result["help_text"] = schedule_help_text()
@@ -652,7 +663,7 @@ def extract_inline_task_name(prompt: str) -> tuple[str, str | None]:
 
 def is_schedule_creation_intent(text: str) -> bool:
     creation_markers = ("创建", "新建", "设置", "新增", "创个", "建个", "怎么建", "怎么创建")
-    return (
+    explicit_intent = (
         "定时任务" in text and any(marker in text for marker in creation_markers)
     ) or ("提醒" in text and any(marker in text for marker in creation_markers)) or (
         "每天" in text and any(marker in text for marker in ("推送", "提醒", "通知", "发送"))
@@ -660,6 +671,37 @@ def is_schedule_creation_intent(text: str) -> bool:
         bool(re.match(r"^(?:请|帮我|请帮我|我想|希望)?\s*每天", text.strip()))
         and any(word in text for word in ("分析", "查询", "汇总", "检查"))
     ) or bool(re.search(r"每(?:个)?(?:周|星期|礼拜)\s*[一二三四五六日天1-7]", text))
+    if explicit_intent:
+        return True
+    recurring = re.search(
+        r"每天|工作日|每逢|每(?:个)?(?:周|星期|礼拜)|"
+        r"(?:周|星期|礼拜)[一二三四五六日天1-7].*(?:到|至)"
+        r"(?:(?:周|星期|礼拜)\s*)?[一二三四五六日天1-7]",
+        text,
+    )
+    received_filter = re.search(
+        r"(?:点(?:半|[零〇一二两三四五六七八九十\d]{1,3}分?)?|[:：]\d{1,2})"
+        r"\s*(?:前|之前|以前)?\s*(?:收到|接收)",
+        text,
+    )
+    clocks = list(CLOCK_PATTERN.finditer(text))
+    action_words = ("分析", "查询", "汇总", "检查", "整理", "推送", "提醒", "通知", "发送", "发给")
+    if (
+        clocks
+        and not received_filter
+        and any(word in text for word in action_words)
+        and (
+            len(clocks) > 1
+            or any(word in text for word in ("按时", "准时", "到点", "届时", "定时"))
+        )
+    ):
+        return True
+    return bool(
+        recurring
+        and CLOCK_PATTERN.search(text)
+        and not received_filter
+        and any(word in text for word in action_words)
+    )
 
 
 def looks_like_email_schedule(text: str) -> bool:
@@ -669,9 +711,14 @@ def looks_like_email_schedule(text: str) -> bool:
 
 def is_schedule_management_intent(text: str) -> bool:
     markers = (
+        "查询",
         "查看",
+        "看看",
         "列出",
         "显示",
+        "有几个",
+        "多少",
+        "哪些",
         "删除",
         "删掉",
         "移除",
@@ -695,7 +742,7 @@ def is_schedule_management_intent(text: str) -> bool:
         "执行记录",
         "执行历史",
     )
-    return "定时任务" in text and any(marker in text for marker in markers)
+    return "任务" in text and any(marker in text for marker in markers)
 
 
 def invalid_time_command(message: str) -> dict[str, str]:
@@ -898,6 +945,12 @@ async def create_scheduled_task(app: TenantApp, event: dict[str, Any], command: 
         if not prompt:
             return "没有找到可以继承的上一条业务问题，请在定时命令中写明要执行的内容。"
     execution_mode = command.get("execution_mode") or execution_mode_for_prompt(prompt)
+    timeout_seconds = settings.scheduler_task_timeout_seconds
+    if execution_mode == "agent":
+        from app.email_service import looks_like_email_request
+
+        if looks_like_email_request(prompt):
+            timeout_seconds = max(timeout_seconds, settings.email_analysis_timeout_seconds)
     explicit_name = normalize_explicit_task_name(command.get("task_name") or "")
     if explicit_name:
         if len(explicit_name) > 40:
@@ -950,7 +1003,7 @@ async def create_scheduled_task(app: TenantApp, event: dict[str, Any], command: 
                 prompt,
                 next_run_at,
                 execution_mode,
-                settings.scheduler_task_timeout_seconds,
+                timeout_seconds,
                 settings.scheduler_max_retries,
                 scheduler_runtime.DEFAULT_TIMEZONE,
             ),

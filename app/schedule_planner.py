@@ -153,7 +153,7 @@ SCHEDULE_PLANNER_PROMPT = """
 10. original_request 是引用回复链中的原始创建请求，follow_up 是用户当前补充。两者存在时合并理解。
 11. “八点前”“九点之前”是截止时间，不是精确执行时刻；未说明具体运行时间或提前量时 action=clarify，不能自行当作八点、九点执行。
 12. 使用“点”表达且小时为1至12时，未说明上午、下午、晚上等时段属于歧义，action=clarify，并只询问时段；24小时制如09:00、17:00没有歧义。唯一约定：“每天9点和5点”按工作时间理解为09:00和17:00；其他组合不得猜测。
-13. “查询定时任务”，“查询任务”等其他相关的查询任务指令,
+13. “查询我的任务”“看看我的任务”等未写出“定时”的任务管理表达，若没有其他业务对象，按定时任务管理；查询使用 list。
 """
 
 
@@ -212,7 +212,9 @@ def extract_schedule_plan_arguments(response: Any) -> dict[str, Any]:
                 if name not in SCHEDULE_PLAN_FIELDS:
                     continue
                 value = unescape(raw_value.strip())
-                if value.casefold() in {"", "null", "none", "nil"}:
+                if name == "prompt" and not value:
+                    arguments[name] = ""
+                elif value.casefold() in {"", "null", "none", "nil"}:
                     arguments[name] = None
                 elif name == "daily_times":
                     try:
@@ -225,11 +227,34 @@ def extract_schedule_plan_arguments(response: Any) -> dict[str, Any]:
                     arguments[name] = value
             if arguments:
                 return _normalize_schedule_arguments(arguments)
+        json_object = re.search(r"\{.*\}", content, re.DOTALL)
+        if json_object:
+            try:
+                arguments = json.loads(json_object.group(0))
+            except json.JSONDecodeError:
+                pass
+            else:
+                if isinstance(arguments, dict):
+                    return _normalize_schedule_arguments(arguments)
     raise SchedulePlanError("模型没有调用定时任务规划工具，请重试")
 
 
 def _normalize_schedule_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
     normalized = dict(arguments)
+    optional_fields = SCHEDULE_PLAN_FIELDS - {"action", "prompt"}
+    for name in optional_fields:
+        value = normalized.get(name)
+        if isinstance(value, str) and value.strip().casefold() in {"", "null", "none", "nil"}:
+            normalized[name] = None
+    action = str(normalized.get("action") or "").strip().casefold()
+    if action in {
+        "query", "search", "view", "get", "query_task", "query_tasks",
+        "list_task", "list_tasks", "查询", "查看", "列出", "查询任务",
+    }:
+        normalized["action"] = "list"
+    elif not action and normalized.get("schedule_type") == "list":
+        normalized["action"] = "list"
+        normalized["schedule_type"] = None
     for name in ("daily_times", "weekly_days"):
         value = normalized.get(name)
         if not isinstance(value, str):

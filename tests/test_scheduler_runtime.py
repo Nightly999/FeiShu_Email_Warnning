@@ -163,6 +163,7 @@ class SchedulerRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("每周五 17:30", answer)
         self.assertEqual(task["weekly_day"], 4)
         self.assertEqual(task["execution_mode"], "agent")
+        self.assertEqual(task["timeout_seconds"], get_settings().email_analysis_timeout_seconds)
         self.assertEqual(task["next_run_at"], next_weekly_run(4, "17:30"))
         self.assertIn("每周五 17:30", await list_scheduled_tasks(tenant_app(), event))
 
@@ -463,6 +464,7 @@ class SchedulerRuntimeTests(unittest.IsolatedAsyncioTestCase):
             "分析最近三天的前五封未处理邮件",
         )
         self.assertIs(delivery.await_args.args[2], email_card)
+
 
     async def test_interval_agent_remains_enabled_after_success(self) -> None:
         task_id = await self.insert_due_task(

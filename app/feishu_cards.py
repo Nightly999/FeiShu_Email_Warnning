@@ -225,32 +225,33 @@ def build_welcome_card(*, logged_in: bool = False) -> dict[str, Any]:
                     "tag": "markdown",
                     "content": (
                         "**📨 查询与分析**\n"
-                        "- 可指定最近几小时或几天、邮件数量、发件人和关键词\n"
-                        "- 支持筛选未处理、收件人、抄送和正文提及你的邮件\n"
-                        "- 输出摘要、优先级、待办、负责人、截止时间、风险和附件"
+                        "- `分析最近两天的邮件`\n"
+                        "- `查找张三发送并抄送我的邮件`\n"
+                        "- `停止分析`"
                     ),
                 },
                 {
                     "tag": "markdown",
                     "content": (
-                        "**⏰ 定时邮件简报**\n"
-                        "- 可用自然语言设置每天一个或多个推送时间\n"
-                        "- 到点自动同步、分析邮件，并私聊发送结果\n"
-                        "- 支持查看、修改或取消定时任务"
+                        "**⏰ 定时任务**\n"
+                        "- `周一到周五 17:30 分析邮件并推送给我`\n"
+                        "- `查看我的定时任务`\n"
+                        "- `立即执行 #32 定时任务`\n"
+                        "- `暂停 #32 定时任务` / `恢复 #32 定时任务`\n"
+                        "- `删除 #32 定时任务`"
                     ),
                 },
                 {"tag": "hr"},
                 {
                     "tag": "markdown",
                     "content": (
-                        "💡 **示例**：分析最近两天的邮件\n"
-                        "💡 **示例**：每天 9:30 和 17:20 分析未处理邮件并推送给我"
+                        "💡 直接按上面的格式发送，也可以用意思相近的自然语言。"
                     ),
                 },
                 {
                     "tag": "markdown",
                     "content": (
-                        "<font color=\"grey\">邮箱密码仅用于 POP3 登录验证，不用于模型训练。"
+                        "<font color=\"grey\">邮箱密码仅用于邮箱登录验证。"
                         "</font>"
                     ),
                 },
@@ -268,6 +269,7 @@ def build_answer_card(
     footer_label: str = "您的指令",
 ) -> dict[str, Any]:
     content = normalize_answer_for_card(answer)
+    content, page_commands = _extract_schedule_page_commands(content)
     template, default_title = {
         "success": ("green", "邮件处理结果"),
         "error": ("red", "邮件处理失败"),
@@ -276,10 +278,24 @@ def build_answer_card(
     card_title = title or default_title
     dynamic_elements = _enforce_table_limit(_build_dynamic_elements(content))
     dynamic_elements = _limit_elements_preserving_tail(
-        dynamic_elements, MAX_CARD_ELEMENTS - 2
+        dynamic_elements, MAX_CARD_ELEMENTS - 2 - bool(page_commands)
     )
     elements = [
         *dynamic_elements,
+        *(
+            [
+                {
+                    "tag": "form",
+                    "name": "schedule_page_form",
+                    "elements": [
+                        _schedule_page_button(label, command, index)
+                        for index, (label, command) in enumerate(page_commands)
+                    ],
+                }
+            ]
+            if page_commands
+            else []
+        ),
         {"tag": "hr"},
         {
             "tag": "markdown",
@@ -297,6 +313,38 @@ def build_answer_card(
             "title": {"tag": "plain_text", "content": card_title},
         },
         "body": {"elements": elements},
+    }
+
+
+def _extract_schedule_page_commands(content: str) -> tuple[str, list[tuple[str, str]]]:
+    commands: list[tuple[str, str]] = []
+    lines: list[str] = []
+    for line in content.splitlines():
+        match = re.fullmatch(
+            r"(上一页|下一页)：(查看定时任务(?:\s+#\d+\s+运行记录)?\s+第\d+页)",
+            line.strip(),
+        )
+        if match:
+            commands.append(("← 上一页" if match.group(1) == "上一页" else "下一页 →", match.group(2)))
+        else:
+            lines.append(line)
+    return "\n".join(lines).strip(), commands
+
+
+def _schedule_page_button(label: str, command: str, index: int) -> dict[str, Any]:
+    return {
+        "tag": "button",
+        "name": f"schedule_page_{index}",
+        "text": {"tag": "plain_text", "content": label},
+        "type": "primary_filled",
+        "width": "fill",
+        "form_action_type": "submit",
+        "behaviors": [
+            {
+                "type": "callback",
+                "value": {"action": "schedule_page", "command": command},
+            }
+        ],
     }
 
 

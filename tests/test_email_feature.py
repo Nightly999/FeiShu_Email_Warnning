@@ -24,6 +24,7 @@ from app.email_pop3 import (
 from app.email_security import decrypt_email_password, encrypt_email_password
 from app.email_service import (
     EmailAnalysis,
+    EmailCommandResult,
     EmailPlan,
     _fallback_plan,
     _likely_needs_reply,
@@ -34,8 +35,10 @@ from app.email_service import (
     build_email_login_card,
     build_email_report,
     build_email_report_card,
+    build_email_search_card,
     cancel_email_analysis,
     is_stop_email_analysis_command,
+    looks_like_email_request,
     plan_email_request,
     sync_analyze_report,
     handle_email_command,
@@ -46,8 +49,10 @@ from app.feishu_ws import (
     dispatch_event,
     extract_email_bind_card_action,
     extract_email_page_card_action,
+    extract_schedule_page_card_action,
     process_email_page_card,
     process_email_bind_card,
+    process_schedule_page_card,
     recover_processing_cards,
 )
 from app.logging_security import redact_sensitive_text
@@ -200,7 +205,9 @@ def test_excel_analysis_ignores_styled_empty_rows_and_summarizes_answers() -> No
 
 def test_email_fallback_plan_applies_scope_and_bounds() -> None:
     settings = get_settings()
-    assert EmailPlan(action="query").limit == 999
+    assert looks_like_email_request("进行我的电邮分析") is True
+    assert _fallback_plan("进行我的电邮分析", settings).action == "query"
+    assert EmailPlan(action="query").limit is None
     plan = _fallback_plan("查看最近3天抄送给我的重要邮件", settings)
     assert plan.lookback_hours == 72
     assert plan.scope == "cc"
@@ -258,6 +265,27 @@ def test_stop_email_analysis_cancels_only_the_current_user(monkeypatch) -> None:
     asyncio.run(scenario())
 
 
+def test_system_cancellation_is_not_reported_as_user_stop(monkeypatch) -> None:
+    event = {"tenant_key": "tenant", "app_id": "app", "open_id": "user"}
+    started = asyncio.Event()
+
+    async def slow_analysis(*_args):
+        started.set()
+        await asyncio.sleep(30)
+
+    async def scenario():
+        monkeypatch.setattr("app.email_service.sync_analyze_report", slow_analysis)
+        runner = asyncio.create_task(
+            _run_cancellable_analysis(event, {}, EmailPlan(action="query"))
+        )
+        await started.wait()
+        runner.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await runner
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize(
     "text",
     [
@@ -292,11 +320,13 @@ def test_stop_email_analysis_keeps_other_commands(text: str) -> None:
     assert is_stop_email_analysis_command(text) is False
 
 
-def test_email_analysis_timeout_returns_retry_guidance(monkeypatch) -> None:
+def test_email_analysis_is_not_cancelled_by_an_overall_timeout(monkeypatch) -> None:
     event = {"tenant_key": "tenant", "app_id": "app", "open_id": "user"}
+    expected = EmailCommandResult("分析完成")
 
     async def slow_analysis(*_args):
-        await asyncio.sleep(30)
+        await asyncio.sleep(0.02)
+        return expected
 
     monkeypatch.setattr("app.email_service.sync_analyze_report", slow_analysis)
     monkeypatch.setattr(
@@ -308,8 +338,7 @@ def test_email_analysis_timeout_returns_retry_guidance(monkeypatch) -> None:
         _run_cancellable_analysis(event, {}, EmailPlan(action="query"))
     )
 
-    assert "已自动结束" in result.answer
-    assert "最近20封有附件的邮件" in result.answer
+    assert result is expected
 
 
 def test_text_processing_exception_replaces_progress_card_with_input_guide(monkeypatch) -> None:
@@ -516,8 +545,32 @@ def test_search_filters_account_sender_and_subject_before_limit(monkeypatch) -> 
     assert rows == [{"id": 42}]
     sql, params = calls[0]
     assert sql.index("WHERE m.email_account_id") < sql.index("ORDER BY")
+    assert "TOP 20" not in sql
     assert sql.count("CHARINDEX") == 2
     assert params[0] == 7 and params[-2:] == ("张三", "项目进度")
+
+
+def test_recent_message_query_has_no_default_total_limit(monkeypatch) -> None:
+    from app.email_repository import _list_recent_messages
+
+    calls = []
+
+    class Connection:
+        def execute(self, sql, *params):
+            calls.append((sql, params))
+            return type(
+                "Cursor",
+                (),
+                {"description": [("id",)], "fetchall": lambda self: [(42,)]},
+            )()
+
+    @contextmanager
+    def connection():
+        yield Connection()
+
+    monkeypatch.setattr("app.email_repository._open_connection", connection)
+    assert _list_recent_messages(7, 48, None) == [{"id": 42}]
+    assert "TOP" not in calls[0][0]
 
 
 def test_search_then_analyze_selected_message_is_account_scoped(monkeypatch) -> None:
@@ -763,6 +816,28 @@ def test_analysis_failure_is_not_reported_as_no_matching_email(
 
     assert result.status == "error"
     assert "大模型分析暂时不可用" in result.answer
+
+
+def test_email_analysis_reads_requested_total_for_card_pagination(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sync = AsyncMock(return_value=0)
+    listing = AsyncMock(side_effect=[[], []])
+    monkeypatch.setattr("app.email_service.sync_account", sync)
+    monkeypatch.setattr("app.email_service.list_recent_messages", listing)
+    monkeypatch.setattr("app.email_service._display_name", AsyncMock(return_value=""))
+    monkeypatch.setattr("app.email_service.analyze_pending", AsyncMock())
+
+    asyncio.run(
+        sync_analyze_report(
+            {"message_id": "message-1"},
+            {"id": 1, "email_address": "user@example.com", "retention_days": 7},
+            EmailPlan(action="query", limit=321),
+        )
+    )
+
+    assert sync.await_args.kwargs["max_messages"] == 321
+    assert [call.args[2] for call in listing.await_args_list] == [321, 321]
 
 
 def test_scheduled_report_keeps_previously_pushed_email(
@@ -1045,6 +1120,35 @@ def test_email_report_card_paginates_all_details() -> None:
     assert len(second["body"]["elements"][-1]["elements"]) == 2
 
 
+def test_email_search_card_paginates_all_candidates() -> None:
+    messages = [
+        {
+            "id": index,
+            "sent_at": datetime(2026, 9, 24, 1, 0),
+            "sender_address": "sender@example.com",
+            "subject": f"候选邮件 {index}",
+        }
+        for index in range(1, 46)
+    ]
+
+    card = build_email_search_card(
+        {"email_address": "user@example.com"}, messages, run_ref="search-1"
+    )
+    content = "\n".join(item.get("content", "") for item in card["body"]["elements"])
+    button = card["body"]["elements"][-1]["elements"][0]
+
+    assert "共 **45** 封" in content
+    assert "第 **1/3** 页" in content
+    assert "候选邮件 1" in content
+    assert "候选邮件 21" not in content
+    assert button["behaviors"][0]["value"] == {
+        "action": "email_page",
+        "run_ref": "search-1",
+        "page": 2,
+        "search_only": True,
+    }
+
+
 def test_email_report_card_groups_direct_and_cc_messages() -> None:
     messages = [
         {
@@ -1154,6 +1258,7 @@ def test_extract_email_page_action_keeps_user_scope() -> None:
                     "run_ref": "run-1",
                     "page": 2,
                     "group_by_recipient": True,
+                    "search_only": True,
                 },
             },
         }
@@ -1168,7 +1273,58 @@ def test_extract_email_page_action_keeps_user_scope() -> None:
         "run_ref": "run-1",
         "page": 2,
         "group_by_recipient": True,
+        "search_only": True,
     }
+
+
+def test_extract_schedule_page_action_keeps_user_scope() -> None:
+    app = TenantApp("tenant-1", "app-1", "secret", None, None, "bot-1", None)
+    payload = {
+        "event": {
+            "operator": {"tenant_key": "tenant-1", "open_id": "user-1"},
+            "context": {"open_chat_id": "chat-1", "open_message_id": "message-1"},
+            "action": {
+                "tag": "button",
+                "value": {
+                    "action": "schedule_page",
+                    "command": "查看定时任务 第2页",
+                },
+            },
+        }
+    }
+
+    assert extract_schedule_page_card_action(payload, app) == {
+        "tenant_key": "tenant-1",
+        "app_id": "app-1",
+        "open_id": "user-1",
+        "chat_id": "chat-1",
+        "message_id": "message-1",
+        "command_text": "查看定时任务 第2页",
+        "command": {"schedule_type": "list", "page": "2"},
+    }
+
+
+def test_schedule_page_callback_updates_original_card(monkeypatch: pytest.MonkeyPatch) -> None:
+    app = TenantApp("tenant-1", "app-1", "secret", None, None, "bot-1", None)
+    handle = AsyncMock(return_value="第 2/3 页，共 11 个定时任务")
+    update = AsyncMock(return_value=True)
+    monkeypatch.setattr("app.feishu_ws.handle_schedule_command", handle)
+    monkeypatch.setattr("app.feishu_ws.update_card", update)
+    action = {
+        "tenant_key": "tenant-1",
+        "app_id": "app-1",
+        "open_id": "user-1",
+        "chat_id": "chat-1",
+        "message_id": "message-1",
+        "command_text": "查看定时任务 第2页",
+        "command": {"schedule_type": "list", "page": "2"},
+    }
+
+    asyncio.run(process_schedule_page_card(app, action))
+
+    handle.assert_awaited_once()
+    update.assert_awaited_once()
+    assert update.await_args.args[0:2] == (app, "message-1")
 
 
 def test_email_page_callback_updates_original_card(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1191,6 +1347,7 @@ def test_email_page_callback_updates_original_card(monkeypatch: pytest.MonkeyPat
                 "run_ref": "run-1",
                 "page": 2,
                 "group_by_recipient": True,
+                "search_only": True,
             },
         )
     )
@@ -1202,6 +1359,7 @@ def test_email_page_callback_updates_original_card(monkeypatch: pytest.MonkeyPat
         "run-1",
         2,
         group_by_recipient=True,
+        search_only=True,
     )
     update.assert_awaited_once_with(app, "message-1", card)
 

@@ -48,6 +48,27 @@ def test_scheduled_task_card_supports_custom_title_and_footer() -> None:
     assert "任务：#7" in card["body"]["elements"][-1]["content"]
 
 
+def test_scheduled_task_card_renders_page_commands_as_buttons() -> None:
+    card = build_answer_card(
+        "我有几个任务",
+        "第 1/3 页，共 11 个定时任务\n#43 每周一至周五 17:20 邮件分析\n\n"
+        "下一页：查看定时任务 第2页",
+        title="定时任务",
+    )
+
+    form = next(element for element in card["body"]["elements"] if element["tag"] == "form")
+    button = form["elements"][0]
+    assert button["text"]["content"] == "下一页 →"
+    assert button["behaviors"][0]["value"] == {
+        "action": "schedule_page",
+        "command": "查看定时任务 第2页",
+    }
+    assert all(
+        "下一页：" not in element.get("content", "")
+        for element in card["body"]["elements"]
+    )
+
+
 def test_card_limits_native_tables_and_preserves_final_business_table() -> None:
     sections = []
     for number in range(1, 7):

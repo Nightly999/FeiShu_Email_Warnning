@@ -108,6 +108,103 @@ class SchedulePlannerToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(arguments["run_at"])
         self.assertIsNone(arguments["interval_minutes"])
 
+    async def test_mimo_list_with_empty_prompt_is_valid(self) -> None:
+        response = type(
+            "Response",
+            (),
+            {
+                "tool_calls": [],
+                "content": """<tool_call>
+<function=plan_scheduled_task>
+<parameter=action>list</parameter>
+<parameter=task_id>None</parameter>
+<parameter=page>None</parameter>
+<parameter=schedule_type>None</parameter>
+<parameter=prompt></parameter>
+<parameter=execution_mode>None</parameter>
+</function>
+</tool_call>""",
+            },
+        )()
+        with patch(
+            "app.schedule_planner.invoke_chat_with_fallback",
+            AsyncMock(return_value=response),
+        ):
+            plan = await plan_schedule_creation("查询我的任务")
+
+        self.assertEqual(plan.action, "list")
+        self.assertEqual(plan.prompt, "")
+
+    def test_plain_json_model_fallback_is_supported(self) -> None:
+        response = type(
+            "Response",
+            (),
+            {
+                "tool_calls": [],
+                "content": '{"action":"create","schedule_type":"daily",'
+                '"daily_time":"09:00","prompt":"分析邮件","execution_mode":"agent"}',
+            },
+        )()
+
+        arguments = extract_schedule_plan_arguments(response)
+
+        self.assertEqual(arguments["daily_time"], "09:00")
+        self.assertEqual(arguments["prompt"], "分析邮件")
+
+    async def test_query_alias_from_model_becomes_task_list(self) -> None:
+        response = type(
+            "Response",
+            (),
+            {
+                "content": "",
+                "tool_calls": [{
+                    "name": "plan_scheduled_task",
+                    "args": {
+                        "action": "query",
+                        "task_id": "",
+                        "page": "1",
+                        "schedule_type": "",
+                        "run_at": "",
+                        "daily_time": "",
+                        "daily_times": "",
+                        "weekly_day": "",
+                        "weekly_days": "",
+                        "interval_minutes": "",
+                        "execution_mode": "",
+                        "task_name": "",
+                        "clarification": "",
+                    },
+                }],
+            },
+        )()
+        with patch(
+            "app.schedule_planner.invoke_chat_with_fallback",
+            AsyncMock(return_value=response),
+        ):
+            plan = await plan_schedule_creation("查询我的任务")
+
+        self.assertEqual(plan.action, "list")
+
+    async def test_list_misplaced_in_schedule_type_is_recovered(self) -> None:
+        response = type(
+            "Response",
+            (),
+            {
+                "content": "",
+                "tool_calls": [{
+                    "name": "plan_scheduled_task",
+                    "args": {"schedule_type": "list"},
+                }],
+            },
+        )()
+        with patch(
+            "app.schedule_planner.invoke_chat_with_fallback",
+            AsyncMock(return_value=response),
+        ):
+            plan = await plan_schedule_creation("查询我的任务")
+
+        self.assertEqual(plan.action, "list")
+
     async def test_model_must_return_structured_schedule_tool_call(self) -> None:
         response = type(
             "Response",

@@ -50,6 +50,7 @@ from app.settings import get_settings
 logger = logging.getLogger("email_feature")
 EMAIL_WORDS = (
     "邮件",
+    "电邮",
     "邮箱",
     "收件箱",
     "主送",
@@ -62,7 +63,6 @@ EMAIL_WORDS = (
     "email",
     "mail",
 )
-MAX_EMAIL_QUERY_MESSAGES = 999
 HISTORICAL_LOOKBACK_HOURS = 24 * 365 * 10
 CARD_EMAIL_DETAIL_LIMIT = 20
 SEARCH_SYNC_MAX_MESSAGES = 500  # ponytail: bounded POP3 backfill; use a server-side search API for larger mailboxes.
@@ -71,6 +71,7 @@ _active_analyses: dict[
     tuple[str, str, str], tuple[asyncio.AbstractEventLoop, asyncio.Task[EmailCommandResult]]
 ] = {}
 _cancelled_commands: set[str] = set()
+_user_cancelled_analyses: set[tuple[str, str, str]] = set()
 
 
 class EmailPlan(BaseModel):
@@ -85,7 +86,7 @@ class EmailPlan(BaseModel):
     group_by_recipient: bool = False
     important_only: bool = False
     reply_needed_only: bool = False
-    limit: int = Field(default=MAX_EMAIL_QUERY_MESSAGES, ge=1, le=MAX_EMAIL_QUERY_MESSAGES)
+    limit: int | None = Field(default=None, ge=1)
     sender_contains: str | None = Field(default=None, max_length=200)
     subject_contains: str | None = Field(default=None, max_length=200)
     date_start: str | None = None
@@ -148,6 +149,7 @@ def cancel_email_analysis(event: dict[str, Any], command_id: str = "") -> bool:
         active = _active_analyses.get(key)
         if not active or active[1].done():
             return False
+        _user_cancelled_analyses.add(key)
         if command_id:
             _cancelled_commands.add(command_id)
     active[0].call_soon_threadsafe(active[1].cancel)
@@ -162,18 +164,16 @@ async def _run_cancellable_analysis(
     with _analysis_lock:
         _active_analyses[key] = (asyncio.get_running_loop(), task)
     try:
-        return await asyncio.wait_for(
-            task, timeout=get_settings().email_analysis_timeout_seconds
-        )
-    except TimeoutError:
-        return EmailCommandResult(
-            "本次处理的邮件较多，已自动结束。请缩小范围后重新发送，"
-            "例如“分析最近20封有附件的邮件”。"
-        )
+        return await task
     except asyncio.CancelledError:
+        with _analysis_lock:
+            user_cancelled = key in _user_cancelled_analyses
+        if not user_cancelled:
+            raise
         return EmailCommandResult("邮件分析已停止。")
     finally:
         with _analysis_lock:
+            _user_cancelled_analyses.discard(key)
             if _active_analyses.get(key, (None, None))[1] is task:
                 _active_analyses.pop(key, None)
 
@@ -246,7 +246,7 @@ async def handle_email_command(event: dict[str, Any]) -> EmailCommandResult | No
     if selected:
         return await _analyze_selected_email(event, account, int(selected.group(1)))
     if plan.action == "search":
-        return await _search_email_command(account, plan)
+        return await _search_email_command(event, account, plan)
     if "未读" in text:
         return EmailCommandResult("当前邮箱使用 POP3，无法获取准确的已读/未读状态；‘未推送’不等于‘未读’。如需准确查询未读邮件，需要接入支持已读状态的邮箱接口。")
 
@@ -284,7 +284,9 @@ async def _count_email_command(account: dict[str, Any], plan: EmailPlan) -> Emai
     return EmailCommandResult(f"POP3 收件箱当前共有 {count} 封邮件（不含其他文件夹）。")
 
 
-async def _search_email_command(account: dict[str, Any], plan: EmailPlan) -> EmailCommandResult:
+async def _search_email_command(
+    event: dict[str, Any], account: dict[str, Any], plan: EmailPlan
+) -> EmailCommandResult:
     try:
         if plan.date_start:
             start_day = date.fromisoformat(plan.date_start)
@@ -312,7 +314,18 @@ async def _search_email_command(account: dict[str, Any], plan: EmailPlan) -> Ema
         return EmailCommandResult("邮件查找失败，请稍后重试。", status="error")
     if not rows:
         return EmailCommandResult("没有找到符合条件的邮件。请确认日期、发件人或主题。")
-    lines = [f"候选邮件（显示前 {len(rows)} 封，最多 20 封）："]
+    run_ref = str(event.get("message_id") or secrets.token_hex(12))
+    await create_push_logs([int(row["id"]) for row in rows], "search", "", run_ref)
+    card = build_email_search_card(account, rows, run_ref=run_ref)
+    return EmailCommandResult(
+        _email_search_text(rows[:CARD_EMAIL_DETAIL_LIMIT], len(rows)),
+        card=card,
+        run_ref=run_ref,
+    )
+
+
+def _email_search_text(rows: list[dict[str, Any]], total: int) -> str:
+    lines = [f"候选邮件共 {total} 封："]
     for row in rows:
         sent_at = row.get("sent_at")
         when = (sent_at + timedelta(hours=8)).strftime("%m-%d %H:%M") if isinstance(sent_at, datetime) else "时间未知"
@@ -320,7 +333,7 @@ async def _search_email_command(account: dict[str, Any], plan: EmailPlan) -> Ema
         subject = str(row.get("subject") or "无主题").replace("\n", " ")[:55]
         lines.append(f"#{row['id']}  {when}  {sender}  {subject}")
     lines.append("发送“分析邮件 #编号”可分析指定的一封。")
-    return EmailCommandResult("\n".join(lines))
+    return "\n".join(lines)
 
 
 async def _analyze_selected_email(
@@ -557,9 +570,7 @@ def _explicit_query_controls(text: str) -> dict[str, Any]:
         r"(?:前|最近|查看|查询|分析)?\s*(\d{1,3})\s*(?:封|份)", text
     )
     if count_match:
-        controls["limit"] = min(
-            MAX_EMAIL_QUERY_MESSAGES, max(1, int(count_match.group(1)))
-        )
+        controls["limit"] = max(1, int(count_match.group(1)))
     positions = [int(value) for value in re.findall(r"第\s*(\d{1,2})\s*封", text)]
     if positions:
         controls["message_positions"] = positions[:20]
@@ -645,7 +656,11 @@ async def sync_analyze_report(
     event: dict[str, Any], account: dict[str, Any], plan: EmailPlan
 ) -> EmailCommandResult:
     try:
-        await sync_account(account, lookback_hours=plan.lookback_hours)
+        await sync_account(
+            account,
+            lookback_hours=plan.lookback_hours,
+            max_messages=plan.limit or SEARCH_SYNC_MAX_MESSAGES,
+        )
     except EmailAuthenticationError:
         return EmailCommandResult("邮箱账号或密码已失效，请重新绑定邮箱。", status="error")
     except EmailConnectionError as exc:
@@ -659,7 +674,9 @@ async def sync_analyze_report(
         logger.exception("Email synchronization failed")
         return EmailCommandResult("邮箱同步失败，请稍后重试或联系信息管理中心。", status="error")
 
-    messages = await list_recent_messages(int(account["id"]), plan.lookback_hours)
+    messages = await list_recent_messages(
+        int(account["id"]), plan.lookback_hours, plan.limit
+    )
     display_name = await _display_name(event)
     selected = [item for item in messages if _matches(item, account["email_address"], display_name, plan.scope)]
     selected = _select_messages(selected, plan)
@@ -669,7 +686,9 @@ async def sync_analyze_report(
         account["email_address"],
         display_name,
     )
-    refreshed = await list_recent_messages(int(account["id"]), plan.lookback_hours)
+    refreshed = await list_recent_messages(
+        int(account["id"]), plan.lookback_hours, plan.limit
+    )
     ids = {int(item["id"]) for item in selected}
     failed_count = sum(
         int(item["id"]) in ids and item.get("analysis_status") == "failed"
@@ -685,7 +704,8 @@ async def sync_analyze_report(
         selected = [item for item in selected if item.get("importance") == "高"]
     if plan.reply_needed_only:
         selected = [item for item in selected if _likely_needs_reply(item)]
-    selected = selected[: plan.limit]
+    if plan.limit is not None:
+        selected = selected[: plan.limit]
     answer = build_email_report(account, selected, plan)
     message_ids = [int(item["id"]) for item in selected]
     run_ref = str(event.get("message_id") or secrets.token_hex(12))
@@ -1011,12 +1031,55 @@ def build_email_report_card(
     }
 
 
+def build_email_search_card(
+    account: dict[str, Any], messages: list[dict[str, Any]],
+    *, page: int = 1, run_ref: str | None = None,
+) -> dict[str, Any]:
+    total_pages = max(1, (len(messages) + CARD_EMAIL_DETAIL_LIMIT - 1) // CARD_EMAIL_DETAIL_LIMIT)
+    page = min(max(1, page), total_pages)
+    start = (page - 1) * CARD_EMAIL_DETAIL_LIMIT
+    page_messages = messages[start : start + CARD_EMAIL_DETAIL_LIMIT]
+    elements: list[dict[str, Any]] = [
+        {
+            "tag": "markdown",
+            "content": (
+                f"**{escape_lark_md(_mask_email(account['email_address']))}**\n\n"
+                f"共 **{len(messages)}** 封 · 第 **{page}/{total_pages}** 页"
+            ),
+        },
+        {"tag": "hr"},
+        {
+            "tag": "markdown",
+            "content": escape_lark_md(_email_search_text(page_messages, len(messages))),
+        },
+    ]
+    if total_pages > 1 and run_ref:
+        actions = []
+        if page > 1:
+            actions.append(_email_page_button("← 上一页", run_ref, page - 1, False, search_only=True))
+        if page < total_pages:
+            actions.append(_email_page_button("下一页 →", run_ref, page + 1, False, search_only=True))
+        elements.append({"tag": "form", "name": f"email_search_page_form_{page}", "elements": actions})
+    return {
+        "schema": "2.0",
+        "config": {"wide_screen_mode": True, "update_multi": True, "enable_forward": False},
+        "header": {
+            "template": "green",
+            "title": {"tag": "plain_text", "content": "邮件查询结果"},
+        },
+        "body": {"elements": elements},
+    }
+
+
 def _email_page_button(
-    text: str, run_ref: str, page: int, group_by_recipient: bool
+    text: str, run_ref: str, page: int, group_by_recipient: bool,
+    *, search_only: bool = False,
 ) -> dict[str, Any]:
     value: dict[str, Any] = {"action": "email_page", "run_ref": run_ref, "page": page}
     if group_by_recipient:
         value["group_by_recipient"] = True
+    if search_only:
+        value["search_only"] = True
     return {
         "tag": "button",
         "name": f"email_page_{page}",
@@ -1035,11 +1098,18 @@ def _email_page_button(
 
 async def render_email_report_page(
     tenant_key: str, app_id: str, open_id: str, run_ref: str, page: int,
-    *, group_by_recipient: bool = False,
+    *, group_by_recipient: bool = False, search_only: bool = False,
 ) -> dict[str, Any] | None:
     messages = await list_push_run_messages(tenant_key, app_id, open_id, run_ref)
     if not messages:
         return None
+    if search_only:
+        return build_email_search_card(
+            {"email_address": messages[0]["email_address"]},
+            messages,
+            page=page,
+            run_ref=run_ref,
+        )
     return build_email_report_card(
         {"email_address": messages[0]["email_address"]},
         messages,
@@ -1241,7 +1311,7 @@ def _select_messages(
             for position in dict.fromkeys(plan.message_positions)
             if 1 <= position <= len(selected)
         ]
-    return selected[: plan.limit]
+    return selected if plan.limit is None else selected[: plan.limit]
 
 
 def _likely_needs_reply(message: dict[str, Any]) -> bool:

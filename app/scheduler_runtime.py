@@ -174,11 +174,6 @@ def _output_text(output: Any) -> str:
 
 
 async def claim_due_tasks(now: str) -> list[dict[str, Any]]:
-    settings = get_settings()
-    lease_seconds = max(60, settings.scheduler_task_timeout_seconds + 60)
-    locked_until = (now_datetime() + timedelta(seconds=lease_seconds)).strftime(
-        DB_DATETIME_FORMAT
-    )
     async with open_db() as db:
         await db.execute("BEGIN IMMEDIATE")
         await db.execute(
@@ -205,6 +200,13 @@ async def claim_due_tasks(now: str) -> list[dict[str, Any]]:
         )
         rows = [dict(row) for row in await cur.fetchall()]
         if rows:
+            lease_seconds = max(
+                60,
+                max(int(row.get("timeout_seconds") or 120) for row in rows) + 60,
+            )
+            locked_until = (now_datetime() + timedelta(seconds=lease_seconds)).strftime(
+                DB_DATETIME_FORMAT
+            )
             placeholders = ", ".join("?" for _ in rows)
             await db.execute(
                 f"UPDATE scheduled_task SET locked_until = ?, last_status = 'running' "

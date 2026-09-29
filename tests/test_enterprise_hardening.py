@@ -21,7 +21,7 @@ from app.logging_security import redact_sensitive_text
 from app.policy import check_agent_access, check_tool_access
 from app.settings import get_settings
 from app.feishu_cards import build_welcome_card
-from app.welcome import send_daily_welcome_once
+from app.welcome import send_chat_guide
 from app.feishu_ws import is_process_alive
 
 
@@ -328,7 +328,7 @@ class WelcomeMessageTests(unittest.IsolatedAsyncioTestCase):
         restore_environment("APP_ENV", self.previous_app_env)
         self.temp_dir.cleanup()
 
-    async def test_bound_user_does_not_receive_entry_welcome(self) -> None:
+    async def test_bound_user_receives_guide_on_every_chat_entry(self) -> None:
         app = tenant_app()
         event = {
             "tenant_key": app.tenant_key,
@@ -339,13 +339,16 @@ class WelcomeMessageTests(unittest.IsolatedAsyncioTestCase):
         }
         with (
             patch("app.welcome.get_email_account", new_callable=AsyncMock, return_value={"id": 1}),
-            patch("app.welcome.send_card", new_callable=AsyncMock) as send_card,
+            patch("app.welcome.send_card", new_callable=AsyncMock, return_value="om_guide") as send_card,
         ):
-            self.assertFalse(await send_daily_welcome_once(app, event))
+            self.assertTrue(await send_chat_guide(app, event))
+            self.assertTrue(await send_chat_guide(app, event))
 
-        send_card.assert_not_awaited()
+        self.assertEqual(send_card.await_count, 2)
+        card = send_card.await_args.args[2]
+        self.assertEqual(card["header"]["title"]["content"], "功能使用介绍")
 
-    async def test_welcome_message_retries_after_send_failure(self) -> None:
+    async def test_chat_guide_retries_after_send_failure(self) -> None:
         app = tenant_app()
         event = {
             "tenant_key": app.tenant_key,
@@ -354,14 +357,17 @@ class WelcomeMessageTests(unittest.IsolatedAsyncioTestCase):
             "chat_id": "oc_chat",
             "open_id": "ou_example",
         }
-        with patch("app.welcome.send_card", new_callable=AsyncMock) as send_card:
+        with (
+            patch("app.welcome.get_email_account", new_callable=AsyncMock, return_value=None),
+            patch("app.welcome.send_card", new_callable=AsyncMock) as send_card,
+        ):
             send_card.side_effect = [RuntimeError("send failed"), "om_welcome"]
-            self.assertFalse(await send_daily_welcome_once(app, event))
-            self.assertTrue(await send_daily_welcome_once(app, event))
+            self.assertFalse(await send_chat_guide(app, event))
+            self.assertTrue(await send_chat_guide(app, event))
 
         self.assertEqual(send_card.await_count, 2)
 
-    async def test_unbound_user_receives_login_card_on_chat_entry(self) -> None:
+    async def test_unbound_user_receives_guide_on_every_chat_entry(self) -> None:
         app = tenant_app()
         event = {
             "tenant_key": app.tenant_key,
@@ -377,19 +383,23 @@ class WelcomeMessageTests(unittest.IsolatedAsyncioTestCase):
         ):
             settings.return_value.feishu_reply_enabled = True
             settings.return_value.email_feature_enabled = True
-            self.assertTrue(await send_daily_welcome_once(app, event))
-            self.assertFalse(await send_daily_welcome_once(app, event))
+            self.assertTrue(await send_chat_guide(app, event))
+            self.assertTrue(await send_chat_guide(app, event))
 
-        self.assertEqual(send_card.await_count, 1)
+        self.assertEqual(send_card.await_count, 2)
         card = send_card.await_args.args[2]
-        self.assertEqual(card["header"]["title"]["content"], "绑定公司邮箱")
-        self.assertEqual(card["body"]["elements"][1]["tag"], "form")
+        self.assertEqual(card["header"]["title"]["content"], "来邮速递｜AI 邮件助手 📬")
 
     def test_welcome_card_uses_interactive_card_format(self) -> None:
         card = build_welcome_card()
         self.assertEqual(card["schema"], "2.0")
         self.assertTrue(card["config"]["wide_screen_mode"])
         self.assertGreaterEqual(len(card["body"]["elements"]), 6)
+        content = "\n".join(
+            element.get("content", "") for element in card["body"]["elements"]
+        )
+        self.assertIn("查看我的定时任务", content)
+        self.assertIn("停止分析", content)
 
 
 def restore_environment(key: str, value: str | None) -> None:

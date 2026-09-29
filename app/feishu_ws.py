@@ -74,9 +74,9 @@ from app.logging_security import install_sensitive_log_filter
 from app.memory.sessions import get_active_session_id
 from app.multi_intent import split_multi_intent_commands
 from app.reply_context import hydrate_reply_context
-from app.scheduler import start_scheduler_thread
+from app.scheduler import handle_schedule_command, parse_schedule_command, start_scheduler_thread
 from app.settings import get_settings
-from app.welcome import send_daily_welcome_once
+from app.welcome import send_chat_guide
 
 
 logger = logging.getLogger("feishu_ws")
@@ -395,8 +395,8 @@ def run_client_process(app_payload: dict[str, Any]) -> None:
                 event.get("chat_id"),
             )
             run_callback_coro(
-                send_daily_welcome_once(app, event),
-                label="daily_welcome",
+                send_chat_guide(app, event),
+                label="chat_guide",
                 bot_code=app.bot_code,
             )
         except Exception:
@@ -407,7 +407,8 @@ def run_client_process(app_payload: dict[str, Any]) -> None:
             payload = json.loads(lark.JSON.marshal(data))
             page_action = extract_email_page_card_action(payload, app)
             bind_action = extract_email_bind_card_action(payload, app)
-            if not page_action and not bind_action:
+            schedule_action = extract_schedule_page_card_action(payload, app)
+            if not page_action and not bind_action and not schedule_action:
                 return P2CardActionTriggerResponse(
                     {"toast": {"type": "warning", "content": "无法识别该卡片操作。"}}
                 )
@@ -416,10 +417,17 @@ def run_client_process(app_payload: dict[str, Any]) -> None:
                     {"toast": {"type": "error", "content": "当前请求较多，请稍后重试。"}}
                 )
             try:
+                processor = (
+                    process_schedule_page_card_thread
+                    if schedule_action
+                    else process_email_page_card_thread
+                    if page_action
+                    else process_email_bind_card_thread
+                )
                 future = event_executor.submit(
-                    process_email_page_card_thread if page_action else process_email_bind_card_thread,
+                    processor,
                     app_payload,
-                    page_action or bind_action,
+                    schedule_action or page_action or bind_action,
                 )
                 future.add_done_callback(release_event_slot)
             except Exception:
@@ -429,7 +437,7 @@ def run_client_process(app_payload: dict[str, Any]) -> None:
                 {
                     "toast": {
                         "type": "info",
-                        "content": "正在切换页面…" if page_action else "正在验证邮箱账号，请稍候…",
+                        "content": "正在切换页面…" if page_action or schedule_action else "正在验证邮箱账号，请稍候…",
                     }
                 }
             )
@@ -542,11 +550,69 @@ def extract_email_page_card_action(
     }
     if value.get("group_by_recipient") is True:
         result["group_by_recipient"] = True
+    if value.get("search_only") is True:
+        result["search_only"] = True
     if not all(result[key] for key in ("tenant_key", "app_id", "open_id", "chat_id", "message_id")):
         return None
-    if not run_ref or len(run_ref) > 100 or not 1 <= page <= 100:
+    if not run_ref or len(run_ref) > 100 or not 1 <= page <= 10000:
         return None
     return result
+
+
+def extract_schedule_page_card_action(
+    payload: dict[str, Any], app: TenantApp
+) -> dict[str, Any] | None:
+    event = payload.get("event") or {}
+    operator = event.get("operator") or {}
+    action = event.get("action") or {}
+    value = action.get("value") or {}
+    context = event.get("context") or {}
+    if value.get("action") != "schedule_page" or action.get("tag") != "button":
+        return None
+    tenant_key = str(operator.get("tenant_key") or app.tenant_key or "")
+    if app.tenant_key and tenant_key != app.tenant_key:
+        return None
+    command_text = str(value.get("command") or "").strip()
+    command = parse_schedule_command(command_text) if len(command_text) <= 100 else None
+    if not command or command.get("schedule_type") not in {"list", "history"}:
+        return None
+    result = {
+        "tenant_key": tenant_key,
+        "app_id": app.app_id,
+        "open_id": str(operator.get("open_id") or ""),
+        "chat_id": str(context.get("open_chat_id") or ""),
+        "message_id": str(context.get("open_message_id") or ""),
+        "command_text": command_text,
+        "command": command,
+    }
+    if not all(result[key] for key in ("tenant_key", "app_id", "open_id", "chat_id", "message_id")):
+        return None
+    return result
+
+
+def process_schedule_page_card_thread(
+    app_payload: dict[str, Any], action: dict[str, Any]
+) -> None:
+    try:
+        asyncio.run(process_schedule_page_card(TenantApp(**app_payload), action))
+    except Exception:
+        logger.exception("Failed to process schedule page card")
+
+
+async def process_schedule_page_card(
+    app: TenantApp, action: dict[str, Any]
+) -> None:
+    event = {
+        "tenant_key": action["tenant_key"],
+        "app_id": action["app_id"],
+        "open_id": action["open_id"],
+        "chat_id": action["chat_id"],
+        "chat_type": "p2p",
+    }
+    answer = await handle_schedule_command(app, event, action["command"])
+    card = build_answer_card(action["command_text"], answer, title="定时任务")
+    if not await update_card(app, action["message_id"], card):
+        await send_card(app, action["chat_id"], card)
 
 
 def process_email_page_card_thread(
@@ -568,6 +634,7 @@ async def process_email_page_card(
         action["run_ref"],
         action["page"],
         group_by_recipient=bool(action.get("group_by_recipient")),
+        search_only=bool(action.get("search_only")),
     )
     if not card:
         await send_card(
